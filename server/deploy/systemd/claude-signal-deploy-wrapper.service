@@ -1,0 +1,17 @@
+[Unit]
+Description=claude-signal: deploy wrapper (pull + build + run the deployed container)
+After=network.target
+
+[Service]
+Type=simple
+User=claude-signal
+# XDG_RUNTIME_DIR for rootless Podman is computed by deploy_wrapper.py itself at
+# runtime via os.getuid(), same reasoning as claude-signal-wrapper.service on the
+# ai instance - systemd's %U specifier does not reliably resolve on this system.
+EnvironmentFile=/etc/claude-signal/env
+ExecStart=/usr/bin/python3 /opt/claude-signal/deploy_wrapper.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

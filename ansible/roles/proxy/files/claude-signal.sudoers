@@ -1,0 +1,3 @@
+claude-signal ALL=(root) NOPASSWD: /usr/sbin/squid -k reconfigure
+claude-signal ALL=(root) NOPASSWD: /usr/local/sbin/claude-signal-web-gate open
+claude-signal ALL=(root) NOPASSWD: /usr/local/sbin/claude-signal-web-gate closed

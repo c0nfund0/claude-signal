@@ -1,0 +1,9 @@
+---
+- name: restart claude-wrapper
+  ansible.builtin.systemd:
+    name: claude-signal-wrapper
+    state: restarted
+
+- name: daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true

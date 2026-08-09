@@ -1,0 +1,20 @@
+[Unit]
+Description=claude-signal: persistent signal-cli JSON-RPC daemon
+# Keeps one JVM + one connection to Signal's servers alive continuously, so
+# signal_bridge.py gets pushed messages in well under a second instead of the
+# 10-18s per-cycle overhead of spawning a fresh `signal-cli receive` process.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-signal
+EnvironmentFile=/etc/claude-signal/env
+RuntimeDirectory=claude-signal
+RuntimeDirectoryMode=0750
+ExecStart=/opt/signal-cli/bin/signal-cli -a ${BOT_NUMBER} daemon --socket /run/claude-signal/signal-cli.sock --receive-mode on-start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

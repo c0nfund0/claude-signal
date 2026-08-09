@@ -1,0 +1,106 @@
+---
+- name: Configure apt to use the Squid proxy
+  # Same reasoning as the ai instance - apt does not read HTTP_PROXY/HTTPS_PROXY,
+  # it needs its own Acquire::*::Proxy config. The domains apt needs still have to
+  # be allowed via Signal ("allow <domain> permanent") - this only wires up the path.
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/95claude-signal-proxy
+    content: |
+      Acquire::http::Proxy "http://{{ proxy_private_ip }}:{{ squid_port }}/";
+      Acquire::https::Proxy "http://{{ proxy_private_ip }}:{{ squid_port }}/";
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install Podman and git
+  ansible.builtin.apt:
+    name:
+      - podman
+      - git
+      - ca-certificates
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure claude-signal has a subuid range for rootless Podman
+  ansible.builtin.lineinfile:
+    path: /etc/subuid
+    line: "claude-signal:200000:65536"
+    regexp: '^claude-signal:'
+    create: true
+
+- name: Ensure claude-signal has a subgid range for rootless Podman
+  ansible.builtin.lineinfile:
+    path: /etc/subgid
+    line: "claude-signal:200000:65536"
+    regexp: '^claude-signal:'
+    create: true
+
+- name: Enable systemd lingering for claude-signal (rootless Podman needs a persistent user runtime dir)
+  ansible.builtin.command: loginctl enable-linger claude-signal
+  args:
+    creates: /var/lib/systemd/linger/claude-signal
+
+- name: Deploy deploy_wrapper.py
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/deploy/deploy_wrapper.py"
+    dest: /opt/claude-signal/deploy_wrapper.py
+    owner: claude-signal
+    group: claude-signal
+    mode: "0750"
+  notify: restart deploy-wrapper
+
+- name: Ensure the deploy work directory exists
+  ansible.builtin.file:
+    path: /opt/claude-signal/deploy-work
+    state: directory
+    owner: claude-signal
+    group: claude-signal
+    mode: "0750"
+
+- name: Configure automatic security updates
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/roles/common/tasks/auto_updates.yml"
+
+# GITHUB_TOKEN is deliberately NOT kept in group_vars/all.yml - same reasoning and
+# same mechanism as the ai role's identical task: the user sets it by SSHing in
+# directly, never pasted into chat/session. Preserve whatever is already live
+# rather than template an empty value over it.
+- name: Check for an existing GITHUB_TOKEN already set on the server
+  ansible.builtin.command: grep -h '^GITHUB_TOKEN=' /etc/claude-signal/env
+  register: existing_github_token
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Preserve an existing on-server GITHUB_TOKEN if group_vars doesn't define one
+  ansible.builtin.set_fact:
+    effective_github_token: >-
+      {{ github_token if (github_token | default('') | length > 0)
+         else (existing_github_token.stdout.split('=', 1)[1] if existing_github_token.rc == 0 else '') }}
+  no_log: true
+
+- name: Template deploy env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: /etc/claude-signal/env
+    owner: root
+    group: claude-signal
+    mode: "0640"
+  notify: restart deploy-wrapper
+  no_log: true
+
+- name: Install claude-signal-deploy-wrapper systemd unit
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/deploy/systemd/claude-signal-deploy-wrapper.service"
+    dest: /etc/systemd/system/claude-signal-deploy-wrapper.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload
+
+- name: Enable and start claude-signal-deploy-wrapper
+  ansible.builtin.systemd:
+    name: claude-signal-deploy-wrapper
+    enabled: true
+    state: started
+    daemon_reload: true

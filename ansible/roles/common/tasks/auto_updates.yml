@@ -1,0 +1,51 @@
+---
+# Shared by both the proxy and ai roles (included at different points - proxy has
+# real internet from the start; ai only after its apt-proxy config + the required
+# ubuntu domains are Signal-approved, so this is allowed to fail gracefully there
+# on a fresh deploy rather than aborting the whole playbook run).
+
+- name: Attempt to install unattended-upgrades
+  ansible.builtin.apt:
+    name: unattended-upgrades
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  register: auto_updates_apt_result
+  ignore_errors: true
+
+- name: Warn if apt access isn't available yet for automatic updates
+  ansible.builtin.debug:
+    msg: >-
+      Could not install unattended-upgrades - on the ai instance this needs
+      'security.ubuntu.com' and the region mirror (e.g.
+      eu-north-1.ec2.archive.ubuntu.com) approved via Signal first
+      ('allow <domain> permanent'), then re-run this playbook.
+  when: auto_updates_apt_result is failed
+
+- name: Enable periodic package list update + unattended upgrade
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+    owner: root
+    group: root
+    mode: "0644"
+  when: auto_updates_apt_result is succeeded
+
+- name: Ensure automatic reboot after unattended upgrades stays disabled
+  # Deliberate: an unattended reboot would interrupt a live Signal session /
+  # running Claude Code task. Reboot manually if a kernel update flags one as
+  # needed - same tradeoff ../CS2Server/ makes for its always-on game server.
+  ansible.builtin.lineinfile:
+    path: /etc/apt/apt.conf.d/50unattended-upgrades
+    regexp: '^\s*//?\s*Unattended-Upgrade::Automatic-Reboot\b.*$'
+    line: 'Unattended-Upgrade::Automatic-Reboot "false";'
+  when: auto_updates_apt_result is succeeded
+
+- name: Enable and start the unattended-upgrades service
+  ansible.builtin.systemd:
+    name: unattended-upgrades
+    enabled: true
+    state: started
+  when: auto_updates_apt_result is succeeded

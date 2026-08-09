@@ -1,0 +1,13 @@
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-web.nginx.j2.
+# The actual open/closed behavior lives in the included state file, toggled by
+# claude-signal-web-gate.sh.j2 (see that file for why this is the right layer for
+# the gate, not the security group).
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        include /etc/claude-signal/web_gate_state.conf;
+    }
+}

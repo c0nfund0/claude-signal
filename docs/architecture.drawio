@@ -1,0 +1,210 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.0.0">
+  <diagram name="claude-signal architecture" id="claude-signal-arch">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1250" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ===================== background / group boxes ===================== -->
+        <mxCell id="aws" value="AWS Account -- eu-north-1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;dashed=1;verticalAlign=top;align=left;fontSize=14;fontStyle=1;spacingLeft=10;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="20" y="240" width="1680" height="820" as="geometry" />
+        </mxCell>
+
+        <mxCell id="vpc" value="Default VPC (172.31.0.0/16)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F5F9FF;strokeColor=#7B96C2;dashed=1;verticalAlign=top;align=left;fontSize=13;fontStyle=1;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="50" y="280" width="1620" height="700" as="geometry" />
+        </mxCell>
+
+        <mxCell id="proxysn" value="Public subnet -- proxy&#10;(routed to Internet Gateway)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E1F0FF;strokeColor=#6C8EBF;dashed=1;verticalAlign=top;align=left;fontSize=12;fontStyle=1;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="80" y="320" width="760" height="560" as="geometry" />
+        </mxCell>
+
+        <mxCell id="aisn" value="Private subnet -- ai&#10;NO route to any Internet Gateway (network-layer isolation)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#B85450;dashed=1;verticalAlign=top;align=left;fontSize=12;fontStyle=1;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="880" y="320" width="760" height="560" as="geometry" />
+        </mxCell>
+
+        <mxCell id="proxyec2" value="EC2: proxy instance (t3.small, public IP)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333333;verticalAlign=top;align=left;fontSize=12;fontStyle=1;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="110" y="380" width="700" height="460" as="geometry" />
+        </mxCell>
+
+        <mxCell id="aiec2" value="EC2: ai instance (t3.small, no public IP)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#333333;verticalAlign=top;align=left;fontSize=12;fontStyle=1;spacingLeft=8;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="910" y="380" width="700" height="300" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== proxy components ===================== -->
+        <mxCell id="signalcli" value="signal-cli&#10;dedicated number, display name &quot;T-X&quot;&#10;username: txbot.48" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="140" y="420" width="310" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="bridge" value="signal_bridge.py&#10;receive loop, /send, command router&#10;matches sender by resolved UUID" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="470" y="420" width="310" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="approval" value="approval_daemon.py&#10;public :8443 = create/poll pending request only&#10;admin 127.0.0.1:7802 = approve / deny / block / allow" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="140" y="510" width="310" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="idle" value="idle_monitor.py&#10;watches Signal + Claude idle time&#10;calls Lambda /stop when both idle" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="470" y="510" width="310" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="squid" value="Squid :3128&#10;/etc/squid/allowed_domains.txt (permanent + timed grants)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="140" y="640" width="640" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="igw" value="Internet Gateway" style="shape=cloud;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="760" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== ai components ===================== -->
+        <mxCell id="wrapper" value="claude_wrapper.py :8443&#10;POST /prompt -- GET /status&#10;sets HTTPS_PROXY / HTTP_PROXY to Squid" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="940" y="420" width="640" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="claudecode" value="claude -p&#10;(Claude Code, --resume for continuity)&#10;--allowedTools incl. WebFetch + the MCP tool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="940" y="510" width="300" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="mcpgate" value="mcp_url_gate.py&#10;stdio MCP tool:&#10;request_url_access(url)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8CECC;strokeColor=#B85450;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1280" y="510" width="300" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== external actors ===================== -->
+        <mxCell id="phone" value="Your phone&#10;(Signal app)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="laptop" value="Your laptop&#10;claude setup-token (browser login)&#10;source of CLAUDE_CODE_OAUTH_TOKEN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1500" y="40" width="240" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lambda" value="Lambda controller + API Gateway&#10;public start/stop URL&#10;GET / starts both -- GET /stop (secret) stops both" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1400" y="900" width="280" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="internet" value="Internet&#10;api.anthropic.com + whatever else you approve" style="shape=cloud;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="1120" width="500" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== edges ===================== -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;startArrow=block;" edge="1" parent="1" source="phone" target="signalcli">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="Signal messages (E2E encrypted, over the internet)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e1">
+            <mxGeometry x="-0.1" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="bridge" target="wrapper">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="POST /prompt (relay_port 8443, SG: ai-sg -> proxy-sg direction reversed, allowed proxy->ai)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e2">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="wrapper" target="claudecode">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="spawns subprocess" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e3">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;startArrow=block;" edge="1" parent="1" source="claudecode" target="mcpgate">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="stdio (local)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e4">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="mcpgate" target="approval">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="POST /request-url-access (public listener only -- can create/poll, never approve)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e5">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="bridge" target="approval">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="yes/no/block/allow/list -&gt; 127.0.0.1:7802 admin (never reachable from ai instance)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e6">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;dashed=1;" edge="1" parent="1" source="approval" target="bridge">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="POST /send (notify user on Signal)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e7">
+            <mxGeometry x="0.3" relative="1" as="geometry"><mxPoint as="offset" y="20" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="approval" target="squid">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="writes allowed_domains.txt + squid -k reconfigure" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e8">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="claudecode" target="squid">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1000" y="770" />
+              <mxPoint x="780" y="770" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="WebFetch / Bash curl via HTTPS_PROXY=proxy:3128 (squid_port, SG-restricted)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e9">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="squid" target="igw">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="allowed domains only" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e10">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="igw" target="internet">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;strokeColor=#B85450;dashed=1;dashPattern=4 4;" edge="1" parent="1" source="aiec2" target="internet">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1260" y="1080" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="NO ROUTE -- blocked at the network layer (no IGW route for this subnet), not just by security group" style="edgeLabel;html=1;fontSize=10;fontColor=#B85450;fontStyle=1;" vertex="1" connectable="0" parent="e12">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;dashed=1;" edge="1" parent="1" source="lambda" target="proxyec2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;dashed=1;" edge="1" parent="1" source="lambda" target="aiec2">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="ec2:StartInstances / StopInstances (Lambda holds the only AWS credentials in this system)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e14">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;" edge="1" parent="1" source="idle" target="lambda">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1540" y="565" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="GET /stop with X-Stop-Secret, once both idle" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e15">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;dashed=1;" edge="1" parent="1" source="laptop" target="aiec2">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="one-time: ssh -J via proxy, write CLAUDE_CODE_OAUTH_TOKEN directly (never through chat)" style="edgeLabel;html=1;fontSize=10;" vertex="1" connectable="0" parent="e16">
+            <mxGeometry x="0" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+          </mxCell>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

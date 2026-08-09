@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-web-gate.sh.j2.
+# Invoked via sudo by approval_daemon.py's /web/open and /web/close admin routes -
+# never directly by anything reachable from the ai instance or the internet.
+#
+# Toggles whether nginx forwards public port 80 to the deploy instance or refuses
+# with 503. Port 80 itself is always reachable (see the proxy_http_public security
+# group rule in network.tf) - this is the same allow/deny-by-content model already
+# used for outbound domains via the Squid allowlist, just for inbound.
+set -euo pipefail
+
+case "${1:-}" in
+  open)
+    cat > /etc/claude-signal/web_gate_state.conf <<EOF
+proxy_pass http://{{ deploy_private_ip }}:{{ deploy_http_port }};
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_connect_timeout 5s;
+EOF
+    ;;
+  closed)
+    cat > /etc/claude-signal/web_gate_state.conf <<'EOF'
+return 503 "closed\n";
+EOF
+    ;;
+  *)
+    echo "usage: $0 open|closed" >&2
+    exit 1
+    ;;
+esac
+
+nginx -t
+systemctl reload nginx

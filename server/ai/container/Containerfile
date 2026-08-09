@@ -1,0 +1,41 @@
+# Hardened sandbox where Claude Code actually runs and edits code. Built on the
+# PROXY instance (real internet access - Docker Hub's pull path needs several
+# domains that aren't worth allowing through Squid) and relayed to the ai instance
+# as a saved image tarball, same pattern as the Node/Claude Code bundle.
+#
+# Node.js + Claude Code are installed the same way as server/proxy/bootstrap/
+# build_ai_bundle.sh does it on the host - a real Node release tarball, not
+# Ubuntu's ancient apt nodejs package - kept consistent deliberately.
+FROM docker.io/library/ubuntu:22.04
+
+ARG NODE_VERSION=20.18.1
+
+# corkscrew: plain `ssh` does NOT read HTTPS_PROXY/HTTP_PROXY the way curl/git-over-
+# https do - it needs an explicit ProxyCommand that speaks HTTP CONNECT, which is all
+# corkscrew does. Confirmed live: without it, `ssh git@github.com` just hangs.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      git openssh-client python3 curl ca-certificates build-essential xz-utils corkscrew && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" && \
+    mkdir -p /opt/node && \
+    tar -xf /tmp/node.tar.xz -C /opt/node --strip-components=1 && \
+    rm /tmp/node.tar.xz
+
+ENV PATH="/opt/node/bin:${PATH}"
+
+RUN mkdir -p /opt/claude-code && \
+    npm install --global --prefix /opt/claude-code @anthropic-ai/claude-code
+
+ENV PATH="/opt/claude-code/bin:${PATH}"
+
+# Fixed uid/gid so the Ansible-managed bind mounts on the host side (which need to
+# chown to this exact numeric id, remapped through the rootless subuid range) don't
+# have to guess it.
+RUN useradd --create-home --shell /bin/bash --uid 1000 coder
+
+USER coder
+WORKDIR /home/coder
+
+ENTRYPOINT ["sleep", "infinity"]

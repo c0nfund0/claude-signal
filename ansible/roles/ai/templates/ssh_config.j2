@@ -1,0 +1,9 @@
+# Managed by Ansible - see ansible/roles/ai/templates/ssh_config.j2.
+# corkscrew tunnels the SSH connection through Squid via HTTP CONNECT (plain ssh
+# does not read HTTPS_PROXY/HTTP_PROXY the way curl/git-over-https do) - github.com
+# still has to be in the Squid allowlist for this to actually connect (it's seeded
+# permanent, see permanent_seed_domains).
+Host github.com
+    User git
+    ProxyCommand corkscrew {{ proxy_private_ip }} {{ squid_port }} %h %p
+    StrictHostKeyChecking accept-new

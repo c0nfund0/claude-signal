@@ -1,0 +1,38 @@
+# Managed by Ansible - see ansible/roles/proxy/templates/squid.conf.j2.
+# Only the ai and deploy instances may use this proxy, and only to reach domains in
+# allowed_domains.txt (managed by approval_daemon.py, not this file).
+acl internal_source src {{ ai_subnet_cidr }}
+acl internal_source src {{ deploy_subnet_cidr }}
+
+acl allowed_domains dstdomain "/etc/squid/allowed_domains.txt"
+
+# SSL_ports here really means "ports allowed for CONNECT tunneling" (Squid's own
+# traditional naming). 22 is added for git-over-SSH (CONNECT tunnel to <host>:22,
+# still gated by allowed_domains like everything else - this doesn't open port 22
+# to arbitrary hosts, only to ones already domain-approved). Safe_ports needs the
+# same addition - confirmed live that "deny !Safe_ports" applies to CONNECT
+# requests too (Squid matches the port from the CONNECT target regardless of
+# method) and runs BEFORE the CONNECT/SSL_ports check, so port 22 being in
+# SSL_ports alone still 403'd every git-over-SSH attempt.
+acl SSL_ports port 443
+acl SSL_ports port 22
+acl Safe_ports port 80
+acl Safe_ports port 443
+acl Safe_ports port 22
+acl CONNECT method CONNECT
+
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+http_access allow internal_source allowed_domains
+http_access deny all
+
+http_port {{ squid_port }}
+
+coredump_dir /var/spool/squid
+
+refresh_pattern ^ftp:           1440    20%     10080
+refresh_pattern ^gopher:        1440    0%      1440
+refresh_pattern -i (/cgi-bin/|\?) 0     0%      0
+refresh_pattern .                0     20%     4320
+
+access_log /var/log/squid/access.log squid

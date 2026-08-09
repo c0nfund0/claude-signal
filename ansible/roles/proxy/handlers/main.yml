@@ -1,0 +1,29 @@
+---
+- name: restart signal-bridge
+  ansible.builtin.systemd:
+    name: claude-signal-signal-bridge
+    state: restarted
+
+- name: restart approval-daemon
+  ansible.builtin.systemd:
+    name: claude-signal-approval-daemon
+    state: restarted
+
+- name: restart idle-monitor
+  ansible.builtin.systemd:
+    name: claude-signal-idle-monitor
+    state: restarted
+
+- name: restart squid
+  ansible.builtin.systemd:
+    name: squid
+    state: restarted
+
+- name: reload nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: reloaded
+
+- name: daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true

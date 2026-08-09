@@ -1,0 +1,27 @@
+[Unit]
+Description=claude-signal: Claude Code wrapper (relay -> podman exec -> claude -p in the sandbox)
+After=network.target claude-signal-sandbox.service
+# Deliberately NOT Requires= - confirmed live that a one-time transient failure in
+# claude-signal-sandbox.service's first start attempt at boot (before its own
+# runtime dir was ready) hard-failed this unit's dependency job and left it
+# "inactive (dead)" even after the sandbox unit's own Restart=on-failure brought it
+# back up 5 seconds later. Requires= does not retry once its dependency job has
+# failed once, no matter how quickly that dependency self-heals. The ExecStartPre
+# wait loop below is what actually guarantees ordering now, and it's covered by
+# this unit's own Restart=on-failure like everything else here.
+
+[Service]
+Type=simple
+User=claude-signal
+# XDG_RUNTIME_DIR for rootless Podman is computed by claude_wrapper.py itself at
+# runtime via os.getuid() - systemd's %U specifier did not resolve correctly on
+# this system's systemd version (resolved to 0/root, breaking Podman's runtime dir
+# lookup), so this deliberately isn't set here.
+EnvironmentFile=/etc/claude-signal/env
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do XDG_RUNTIME_DIR=/run/user/$(id -u claude-signal) /usr/bin/podman inspect claude-signal-sandbox >/dev/null 2>&1 && exit 0; sleep 2; done; echo "timed out waiting for claude-signal-sandbox container" >&2; exit 1'
+ExecStart=/usr/bin/python3 /opt/claude-signal/claude_wrapper.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

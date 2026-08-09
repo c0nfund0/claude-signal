@@ -1,0 +1,221 @@
+---
+# The sandbox container image itself is handled by the "Build and fetch the sandbox
+# image via the proxy" and "Load the sandbox image on the ai instance" plays in
+# ../../playbook.yml, BEFORE this role runs - the ai instance has no internet access
+# to fetch anything itself, so the image has to already be loaded by the time this
+# role's tasks execute.
+
+- name: Install Podman
+  ansible.builtin.apt:
+    name: podman
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure claude-signal has a subuid range for rootless Podman
+  ansible.builtin.lineinfile:
+    path: /etc/subuid
+    line: "claude-signal:200000:65536"
+    regexp: '^claude-signal:'
+    create: true
+
+- name: Ensure claude-signal has a subgid range for rootless Podman
+  ansible.builtin.lineinfile:
+    path: /etc/subgid
+    line: "claude-signal:200000:65536"
+    regexp: '^claude-signal:'
+    create: true
+
+- name: Enable systemd lingering for claude-signal (rootless Podman needs a persistent user runtime dir)
+  ansible.builtin.command: loginctl enable-linger claude-signal
+  args:
+    creates: /var/lib/systemd/linger/claude-signal
+
+- name: Deploy claude_wrapper.py
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/ai/claude_wrapper.py"
+    dest: /opt/claude-signal/claude_wrapper.py
+    owner: claude-signal
+    group: claude-signal
+    mode: "0750"
+  notify: restart claude-wrapper
+
+- name: Ensure the container-tools directory exists (mounted read-only into the sandbox)
+  # World-readable/executable, not 0750: the sandbox container's "coder" user is a
+  # rootless-Podman subuid mapping (host uid 200999), not host uid claude-signal - it
+  # shows up as an unmapped "other" identity from the host's point of view, so 0750
+  # denies it entirely. Safe to open up - these are just tool scripts (secrets are
+  # injected via `claude mcp add --env`, at MCP-launch time, never stored in the
+  # files themselves) and the mount itself is already read-only.
+  ansible.builtin.file:
+    path: /opt/claude-signal/container-tools
+    state: directory
+    owner: claude-signal
+    group: claude-signal
+    mode: "0755"
+
+- name: Deploy mcp_url_gate.py into container-tools
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/ai/mcp_url_gate.py"
+    dest: /opt/claude-signal/container-tools/mcp_url_gate.py
+    owner: claude-signal
+    group: claude-signal
+    mode: "0644"
+
+- name: Deploy mcp_git_gate.py into container-tools
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/ai/mcp_git_gate.py"
+    dest: /opt/claude-signal/container-tools/mcp_git_gate.py
+    owner: claude-signal
+    group: claude-signal
+    mode: "0644"
+
+# 200999 = 200000 (subuid range base above) + 1000 (the coder user's uid inside the
+# container, fixed in the Containerfile) - 1 (container uid 1 maps to the range's
+# first host id). Confirmed empirically, not just computed - see
+# reference_claude_signal_gotchas.md.
+- name: Ensure the sandbox home directory exists, owned by the container's coder user
+  ansible.builtin.file:
+    path: /opt/claude-signal/sandbox-home
+    state: directory
+    owner: "200999"
+    group: "200999"
+    mode: "0750"
+
+- name: Ensure the sandbox home's .ssh directory exists
+  ansible.builtin.file:
+    path: /opt/claude-signal/sandbox-home/.ssh
+    state: directory
+    owner: "200999"
+    group: "200999"
+    mode: "0700"
+
+- name: Template the sandbox's SSH client config (corkscrew tunnels github.com through Squid)
+  ansible.builtin.template:
+    src: ssh_config.j2
+    dest: /opt/claude-signal/sandbox-home/.ssh/config
+    owner: "200999"
+    group: "200999"
+    mode: "0600"
+
+- name: Configure apt to use the Squid proxy
+  # apt does NOT read HTTP_PROXY/HTTPS_PROXY env vars (that's a curl/axios/Node
+  # convention) - confirmed live: apt-get with those env vars set still tried a
+  # direct connection and failed outright ("Network is unreachable"). It needs its
+  # own Acquire::*::Proxy config. The domains apt actually needs still have to be
+  # allowed via Signal ("allow <domain> permanent") - this only wires up the path,
+  # it doesn't grant access to anything.
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/95claude-signal-proxy
+    content: |
+      Acquire::http::Proxy "http://{{ proxy_private_ip }}:{{ squid_port }}/";
+      Acquire::https::Proxy "http://{{ proxy_private_ip }}:{{ squid_port }}/";
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure automatic security updates
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/roles/common/tasks/auto_updates.yml"
+
+- name: Template ai env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: /etc/claude-signal/env
+    owner: root
+    group: claude-signal
+    mode: "0640"
+  notify: restart claude-wrapper
+  no_log: true  # CLAUDE_CODE_OAUTH_TOKEN renders into this file
+
+- name: Install claude-signal-wrapper systemd unit
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/ai/systemd/claude-signal-wrapper.service"
+    dest: /etc/systemd/system/claude-signal-wrapper.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload
+
+- name: Install claude-signal-sandbox (container) systemd unit
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/ai/systemd/claude-signal-sandbox.service"
+    dest: /etc/systemd/system/claude-signal-sandbox.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload
+
+- name: Enable and start the sandbox container
+  ansible.builtin.systemd:
+    name: claude-signal-sandbox
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Look up claude-signal's uid (rootless Podman needs its own XDG_RUNTIME_DIR)
+  ansible.builtin.command: id -u claude-signal
+  register: claude_signal_uid
+  changed_when: false
+
+- name: Check whether the request_url_access MCP tool is already registered in the container
+  become_user: claude-signal
+  ansible.builtin.command:
+    cmd: podman exec claude-signal-sandbox claude mcp get claude-signal-url-gate
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ claude_signal_uid.stdout }}"
+  register: mcp_check
+  changed_when: false
+  failed_when: false
+
+- name: Register the request_url_access MCP tool inside the container
+  become_user: claude-signal
+  ansible.builtin.command:
+    # --transport stdio has to sit between the last --env and the server name -
+    # otherwise the CLI reads the name as another --env pair and rejects it.
+    cmd: >
+      podman exec claude-signal-sandbox claude mcp add --scope user
+      --env PROXY_PRIVATE_IP={{ proxy_private_ip }}
+      --env RELAY_PORT={{ relay_port }}
+      --env RELAY_SECRET={{ relay_secret }}
+      --transport stdio claude-signal-url-gate
+      -- /usr/bin/python3 /opt/tools/mcp_url_gate.py
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ claude_signal_uid.stdout }}"
+  when: mcp_check.rc != 0
+
+- name: Check whether the git-gate MCP tools are already registered in the container
+  become_user: claude-signal
+  ansible.builtin.command:
+    cmd: podman exec claude-signal-sandbox claude mcp get claude-signal-git-gate
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ claude_signal_uid.stdout }}"
+  register: git_mcp_check
+  changed_when: false
+  failed_when: false
+
+- name: Register the git-gate MCP tools (request_git_push, request_repo_create) inside the container
+  # No GITHUB_TOKEN here on purpose - see the note at the top of mcp_git_gate.py.
+  # Repo creation is a relay to approval_daemon (which holds the token) now, the
+  # same way deploy triggering already worked - this tool only ever needs
+  # RELAY_SECRET to ask for approval and poll, which is the low-risk credential
+  # (it can only create/poll pending requests, never grant one - see
+  # approval_daemon.py's own docstring on that split).
+  become_user: claude-signal
+  ansible.builtin.command:
+    cmd: >
+      podman exec claude-signal-sandbox claude mcp add --scope user
+      --env PROXY_PRIVATE_IP={{ proxy_private_ip }}
+      --env RELAY_PORT={{ relay_port }}
+      --env RELAY_SECRET={{ relay_secret }}
+      --transport stdio claude-signal-git-gate
+      -- /usr/bin/python3 /opt/tools/mcp_git_gate.py
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ claude_signal_uid.stdout }}"
+  when: git_mcp_check.rc != 0
+
+- name: Enable and start claude-signal-wrapper
+  ansible.builtin.systemd:
+    name: claude-signal-wrapper
+    enabled: true
+    state: started
+    daemon_reload: true

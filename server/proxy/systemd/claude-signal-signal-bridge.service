@@ -1,0 +1,16 @@
+[Unit]
+Description=claude-signal: Signal bridge (bot number I/O + command router)
+After=network-online.target claude-signal-signal-cli-daemon.service
+Wants=network-online.target
+Requires=claude-signal-signal-cli-daemon.service
+
+[Service]
+Type=simple
+User=claude-signal
+EnvironmentFile=/etc/claude-signal/env
+ExecStart=/usr/bin/python3 /opt/claude-signal/signal_bridge.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

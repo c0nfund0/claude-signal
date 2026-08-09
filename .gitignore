@@ -1,0 +1,24 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+terraform.tfvars
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+lambda/app.zip
+ansible/group_vars/all.yml
+ansible/.cache/
+ansible/*.retry
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
+# Local Claude Code session state - not part of the project
+.claude/*.lock

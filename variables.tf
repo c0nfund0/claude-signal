@@ -1,0 +1,133 @@
+variable "aws_region" {
+  description = "AWS region to deploy into"
+  type        = string
+  default     = "eu-north-1"
+}
+
+variable "name" {
+  description = "Project name prefix used for resource naming and tagging"
+  type        = string
+  default     = "claude-signal"
+}
+
+variable "admin_cidr" {
+  description = "CIDR block (your public IP, e.g. 203.0.113.5/32) allowed to SSH into the proxy instance"
+  type        = string
+
+  validation {
+    condition     = can(cidrhost(var.admin_cidr, 0))
+    error_message = "admin_cidr must be a valid CIDR block, e.g. 203.0.113.5/32."
+  }
+}
+
+variable "ssh_public_key" {
+  description = "Public key content (e.g. contents of ~/.ssh/id_ed25519.pub) used to SSH into both instances"
+  type        = string
+}
+
+variable "stop_secret" {
+  description = "Shared secret an on-instance idle monitor sends to authorize the Lambda's /stop route (e.g. output of `openssl rand -hex 32`)"
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition     = length(var.stop_secret) >= 32
+    error_message = "stop_secret should be a long random string (32+ chars), e.g. `openssl rand -hex 32`."
+  }
+}
+
+variable "ai_instance_type" {
+  description = "EC2 instance type for the isolated AI (Claude Code) instance"
+  type        = string
+  default     = "t3.small"
+
+  validation {
+    condition     = contains(["t3.micro", "t3.small", "t3.medium"], var.ai_instance_type)
+    error_message = "ai_instance_type must be one of: t3.micro, t3.small, t3.medium."
+  }
+}
+
+variable "proxy_instance_type" {
+  description = "EC2 instance type for the internet-facing proxy instance"
+  type        = string
+  default     = "t3.small"
+
+  validation {
+    condition     = contains(["t3.micro", "t3.small", "t3.medium"], var.proxy_instance_type)
+    error_message = "proxy_instance_type must be one of: t3.micro, t3.small, t3.medium."
+  }
+}
+
+variable "ai_root_volume_size" {
+  description = "Root EBS volume size in GB for the AI instance"
+  type        = number
+  default     = 20
+}
+
+variable "proxy_root_volume_size" {
+  description = "Root EBS volume size in GB for the proxy instance"
+  type        = number
+  default     = 20
+}
+
+variable "ai_subnet_cidr" {
+  description = "CIDR block for the private AI subnet (no route to any Internet Gateway)"
+  type        = string
+  # 172.31.128.0/24 conflicts with an existing cs2-server-subnet in this account's
+  # default VPC - .130.0/24 avoids that plus the default VPC's own .0/20, .16.0/20,
+  # .32.0/20 subnets and this project's own .129.0/24 proxy subnet.
+  default = "172.31.130.0/24"
+}
+
+variable "proxy_subnet_cidr" {
+  description = "CIDR block for the public proxy subnet"
+  type        = string
+  default     = "172.31.129.0/24"
+}
+
+variable "availability_zone" {
+  description = "Availability zone for both subnets and instances"
+  type        = string
+  default     = "eu-north-1a"
+}
+
+variable "squid_port" {
+  description = "Port the proxy instance's forward proxy (e.g. Squid) will listen on for the AI instance's outbound traffic. Not yet installed by this Terraform config - reserved for the follow-up application-layer phase."
+  type        = number
+  default     = 3128
+}
+
+variable "relay_port" {
+  description = "Port reserved for the internal relay API between the AI and proxy instances (Signal message delivery, URL-approval tool calls). Not yet used by anything - reserved for the follow-up application-layer phase."
+  type        = number
+  default     = 8443
+}
+
+variable "deploy_instance_type" {
+  description = "EC2 instance type for the deploy/web instance"
+  type        = string
+  default     = "t3.micro"
+
+  validation {
+    condition     = contains(["t3.micro", "t3.small", "t3.medium"], var.deploy_instance_type)
+    error_message = "deploy_instance_type must be one of: t3.micro, t3.small, t3.medium."
+  }
+}
+
+variable "deploy_root_volume_size" {
+  description = "Root EBS volume size in GB for the deploy/web instance"
+  type        = number
+  default     = 20
+}
+
+variable "deploy_subnet_cidr" {
+  description = "CIDR block for the private deploy subnet (no route to any Internet Gateway - same isolation model as the AI subnet; the only path in or out is via the proxy instance)"
+  type        = string
+  default     = "172.31.131.0/24"
+}
+
+variable "deploy_http_port" {
+  description = "Port the deploy instance's currently-running deployed container listens on, on the host. The proxy reverse-proxies public port 80 to this port on the deploy instance's private IP, gated by Signal approval - it is never exposed directly."
+  type        = number
+  default     = 8080
+}

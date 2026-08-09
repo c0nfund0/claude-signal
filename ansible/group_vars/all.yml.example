@@ -1,0 +1,59 @@
+# Copy to group_vars/all.yml and fill in real values (gitignored - contains secrets,
+# same treatment as ../terraform.tfvars).
+
+# --- from `terraform output` (proxy_public_ip changes on every stop/start - no
+#     Elastic IP, see main README - update this before each ansible-playbook run) ---
+proxy_public_ip: "203.0.113.10"
+proxy_private_ip: "172.31.129.xxx"
+ai_private_ip: "172.31.130.xxx"
+deploy_private_ip: "172.31.131.xxx"
+controller_url: "https://xxxxxxxxxx.execute-api.eu-north-1.amazonaws.com/"
+
+# --- must match variables.tf / terraform.tfvars ---
+ai_subnet_cidr: "172.31.130.0/24"
+deploy_subnet_cidr: "172.31.131.0/24"
+relay_port: 8443
+squid_port: 3128
+bridge_port: 7801
+local_admin_port: 7802
+deploy_http_port: 8080
+
+# --- must match var.stop_secret in ../terraform.tfvars exactly ---
+stop_secret: "REPLACE_ME"
+
+# --- shared secret between proxy and ai daemons - any long random string, must be
+#     IDENTICAL on both hosts. If you already have a live deployment, copy the
+#     current value from /etc/claude-signal/env on the proxy rather than generating
+#     a new one, or every daemon will need restarting with mismatched secrets until
+#     both sides converge. `openssl rand -hex 32` for a fresh deployment. ---
+relay_secret: "REPLACE_ME"
+
+# --- Signal ---
+bot_number: "+15551234567"
+allowed_sender_username: "yourusername.42"
+
+# --- policy ---
+idle_seconds: 1800
+default_approval_seconds: 3600
+# github.com (git-over-SSH, port 22 via Squid CONNECT) and api.github.com (repo
+# creation via the REST API) are core infra for the gated git tools, not ad-hoc
+# browsing targets - seeded permanent like api.anthropic.com rather than needing
+# their own Signal approval (the git push/create actions are already individually
+# gated; gating the underlying connectivity too would be redundant).
+permanent_seed_domains: "api.anthropic.com,github.com,api.github.com"
+claude_allowed_tools: "Bash,Read,Edit,Write,Glob,Grep,WebFetch,mcp__claude-signal-url-gate__request_url_access,mcp__claude-signal-git-gate__request_git_push,mcp__claude-signal-git-gate__request_repo_create"
+claude_timeout_seconds: 900
+# Optional - leave unset/empty to use claude_wrapper.py's built-in default persona
+# (T-X, from the Terminator films). Uncomment and edit to change the character.
+# claude_persona_prompt: "You are ..."
+
+# --- set by hand after running `claude setup-token` on a browser-capable machine -
+#     see the "Claude Code auth" section in the main README. Never commit a real
+#     token here even though the file is gitignored - prefer ansible-vault if you
+#     want this checked in at all. ---
+claude_code_oauth_token: ""
+
+# --- GitHub Personal Access Token (classic, `repo` scope) for the dedicated git bot
+#     account - same rule as the Claude token above: never commit a real value, set
+#     by hand over SSH on the server itself, not pasted into chat. ---
+github_token: ""

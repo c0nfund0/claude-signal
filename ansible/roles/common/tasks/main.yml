@@ -1,0 +1,24 @@
+---
+- name: Create claude-signal system user
+  ansible.builtin.user:
+    name: claude-signal
+    system: true
+    home: /opt/claude-signal
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Create /opt/claude-signal
+  ansible.builtin.file:
+    path: /opt/claude-signal
+    state: directory
+    owner: claude-signal
+    group: claude-signal
+    mode: "0755"
+
+- name: Create /etc/claude-signal
+  ansible.builtin.file:
+    path: /etc/claude-signal
+    state: directory
+    owner: claude-signal
+    group: claude-signal
+    mode: "0750"

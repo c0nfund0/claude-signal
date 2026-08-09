@@ -1,0 +1,50 @@
+[Unit]
+Description=claude-signal: hardened sandbox container (Claude Code runs inside this)
+After=network.target systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=claude-signal
+# systemd's %U specifier did not resolve correctly on this system's systemd version
+# (resolved to 0/root instead of claude-signal's uid, breaking rootless Podman's
+# runtime dir lookup) - resolving it dynamically via `id -u` in the ExecStart shell
+# instead is more robust across systemd versions.
+EnvironmentFile=/etc/claude-signal/env
+WorkingDirectory=/opt/claude-signal
+
+# Right after boot, claude-signal's /run/user/<uid> (created by systemd-logind once
+# it processes the lingering user, via loginctl enable-linger) can take a few
+# seconds to appear - confirmed live: this unit started before it existed
+# ("stat /run/user/997: no such file or directory"), failed once, and only
+# succeeded on its own RestartSec=5 retry. Waiting here removes that first-attempt
+# failure entirely rather than relying on the retry to paper over it - a failed
+# first attempt still triggers a "dependency failed" job for anything that
+# Requires= this unit (see claude-signal-wrapper.service), which does NOT
+# self-heal just because this unit recovers seconds later.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do [ -d "/run/user/$(id -u claude-signal)" ] && exit 0; sleep 1; done; echo "timed out waiting for /run/user/$(id -u claude-signal)" >&2; exit 1'
+ExecStartPre=-/bin/bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u claude-signal) /usr/bin/podman rm -f claude-signal-sandbox'
+ExecStart=/bin/bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u claude-signal) /usr/bin/podman run -d --name claude-signal-sandbox \
+  --cap-drop=all \
+  --security-opt no-new-privileges \
+  --pids-limit=512 \
+  --memory=1200m \
+  --read-only --tmpfs /tmp \
+  -v /opt/claude-signal/sandbox-home:/home/coder \
+  -v /opt/claude-signal/container-tools:/opt/tools:ro \
+  -e HTTPS_PROXY=http://${PROXY_PRIVATE_IP}:${SQUID_PORT} \
+  -e HTTP_PROXY=http://${PROXY_PRIVATE_IP}:${SQUID_PORT} \
+  -e NO_PROXY=${PROXY_PRIVATE_IP} \
+  -e no_proxy=${PROXY_PRIVATE_IP} \
+  -e CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN} \
+  -e DISABLE_TELEMETRY=1 \
+  -e DISABLE_ERROR_REPORTING=1 \
+  -e DISABLE_AUTOUPDATER=1 \
+  localhost/claude-signal-sandbox:latest'
+ExecStop=/bin/bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u claude-signal) /usr/bin/podman stop -t 10 claude-signal-sandbox'
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

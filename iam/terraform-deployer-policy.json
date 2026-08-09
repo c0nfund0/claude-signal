@@ -1,0 +1,159 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunInstancesRestrictedType",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:eu-north-1:ACCOUNT_ID:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:InstanceType": ["t3.micro", "t3.small", "t3.medium"]
+        }
+      }
+    },
+    {
+      "Sid": "RunInstancesSupportingResources",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:eu-north-1:ACCOUNT_ID:volume/*",
+        "arn:aws:ec2:eu-north-1:ACCOUNT_ID:network-interface/*",
+        "arn:aws:ec2:eu-north-1:ACCOUNT_ID:subnet/*",
+        "arn:aws:ec2:eu-north-1:ACCOUNT_ID:security-group/*",
+        "arn:aws:ec2:eu-north-1:ACCOUNT_ID:key-pair/*",
+        "arn:aws:ec2:eu-north-1::image/ami-*"
+      ]
+    },
+    {
+      "Sid": "Ec2ReadOnly",
+      "Effect": "Allow",
+      "Action": ["ec2:Describe*"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Ec2ManageProjectResources",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSubnet",
+        "ec2:DeleteSubnet",
+        "ec2:ModifySubnetAttribute",
+        "ec2:CreateRouteTable",
+        "ec2:DeleteRouteTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:ModifySecurityGroupRules",
+        "ec2:AssociateRouteTable",
+        "ec2:DisassociateRouteTable",
+        "ec2:ImportKeyPair",
+        "ec2:DeleteKeyPair",
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:TerminateInstances",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:ModifyInstanceMetadataOptions",
+        "ec2:ModifyVolume",
+        "ec2:CreateTags",
+        "ec2:DeleteTags"
+      ],
+      "Resource": "arn:aws:ec2:eu-north-1:ACCOUNT_ID:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "eu-north-1"
+        }
+      }
+    },
+    {
+      "Sid": "LambdaManageProject",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:DeleteFunction",
+        "lambda:GetFunction",
+        "lambda:GetFunctionCodeSigningConfig",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:GetPolicy",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:ListVersionsByFunction"
+      ],
+      "Resource": "arn:aws:lambda:eu-north-1:ACCOUNT_ID:function:claude-signal-*"
+    },
+    {
+      "Sid": "ApiGatewayManageProject",
+      "Effect": "Allow",
+      "Action": "apigateway:*",
+      "Resource": "arn:aws:apigateway:eu-north-1::/*"
+    },
+    {
+      "Sid": "LogsDescribeAny",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
+    },
+    {
+      "Sid": "LogsDeliveryForApiGatewayAccessLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogDelivery",
+        "logs:GetLogDelivery",
+        "logs:UpdateLogDelivery",
+        "logs:DeleteLogDelivery",
+        "logs:ListLogDeliveries",
+        "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LogsManageProject",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:logs:eu-north-1:ACCOUNT_ID:log-group:/aws/*claude-signal*"
+    },
+    {
+      "Sid": "IamManageProjectRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/claude-signal-*"
+    },
+    {
+      "Sid": "IamPassRoleScoped",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/claude-signal-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": ["lambda.amazonaws.com"]
+        }
+      }
+    }
+  ]
+}

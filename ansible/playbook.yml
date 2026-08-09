@@ -1,0 +1,147 @@
+---
+# claude-signal application-layer deployment.
+#
+# Terraform (../) owns infrastructure - VPC, subnets, security groups, the two
+# EC2 instances, the Lambda start/stop controller. This playbook owns everything
+# that runs ON those instances: packages, the daemons, Squid, and the hardened
+# sandbox container Claude Code actually runs inside.
+#
+# The sandbox container image is the one genuinely cross-host step: it has to be
+# built on the proxy (real internet access - Docker Hub's pull path needs several
+# domains not worth allowing through Squid) and relayed to the ai instance THROUGH
+# the Ansible controller (fetch, then copy) - neither instance holds an SSH key for
+# the other, by design, so a direct proxy->ai transfer isn't possible or attempted.
+
+- name: Common setup on all hosts
+  hosts: proxy:ai:deploy
+  become: true
+  roles:
+    - common
+
+- name: Configure the proxy instance
+  hosts: proxy
+  become: true
+  roles:
+    - proxy
+
+- name: Check whether the sandbox image is already loaded on ai
+  hosts: ai
+  become: true
+  tasks:
+    - name: Look up claude-signal's uid (rootless Podman needs its own XDG_RUNTIME_DIR)
+      ansible.builtin.command: id -u claude-signal
+      register: claude_signal_uid
+      changed_when: false
+
+    - name: Check for the claude-signal-sandbox image
+      become_user: claude-signal
+      ansible.builtin.command:
+        cmd: podman image exists localhost/claude-signal-sandbox:latest
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ claude_signal_uid.stdout }}"
+      register: sandbox_image_check
+      changed_when: false
+      failed_when: false
+
+- name: Build and fetch the sandbox image via the proxy
+  hosts: proxy
+  become: true
+  vars:
+    ai_sandbox_present: "{{ hostvars['ai_host'].sandbox_image_check.rc == 0 }}"
+  tasks:
+    - name: Copy the Containerfile + build script to the proxy
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ playbook_dir }}/../server/ai/container/", dest: /tmp/container, mode: "0644" }
+        - { src: "{{ playbook_dir }}/../server/proxy/bootstrap/build_sandbox_image.sh", dest: /tmp/build_sandbox_image.sh, mode: "0755" }
+      when: not ai_sandbox_present
+
+    - name: Build the sandbox image (via the proxy's real internet access)
+      ansible.builtin.command: /tmp/build_sandbox_image.sh /tmp/container /tmp/sandbox-image.tar
+      when: not ai_sandbox_present
+      register: image_build
+      changed_when: true
+
+    - name: Ensure the local image cache directory exists
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/.cache"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      when: not ai_sandbox_present
+
+    - name: Fetch the image tarball to the Ansible controller
+      # Plain scp, not ansible.builtin.fetch - fetch base64-buffers the whole
+      # file in memory for this connection type, which reliably OOM-kills on a
+      # memory-constrained controller for an ~900MB image. scp streams to disk.
+      ansible.builtin.command:
+        cmd: >
+          scp -o StrictHostKeyChecking=no
+          ubuntu@{{ proxy_public_ip }}:/tmp/sandbox-image.tar
+          {{ playbook_dir }}/.cache/sandbox-image.tar
+      delegate_to: localhost
+      become: false
+      when: not ai_sandbox_present
+      changed_when: true
+
+    - name: Clean up the image tarball on the proxy (it never needs to live there)
+      ansible.builtin.file:
+        path: /tmp/sandbox-image.tar
+        state: absent
+      when: not ai_sandbox_present
+
+- name: Load the sandbox image on the ai instance
+  hosts: ai
+  become: true
+  tasks:
+    - name: Copy the image tarball to the ai instance (relayed through the controller)
+      # Same reasoning as the fetch step above - scp streams instead of
+      # base64-buffering the whole file, avoiding the OOM kill. Goes through the
+      # proxy jump directly since ai has no route from the controller otherwise.
+      ansible.builtin.command:
+        cmd: >
+          scp -o StrictHostKeyChecking=no -o ProxyJump=ubuntu@{{ proxy_public_ip }}
+          {{ playbook_dir }}/.cache/sandbox-image.tar
+          ubuntu@{{ ai_private_ip }}:/tmp/sandbox-image.tar
+      delegate_to: localhost
+      become: false
+      when: sandbox_image_check.rc != 0
+      changed_when: true
+
+    - name: Ensure the relayed tarball is readable for podman load
+      # scp'd in as ubuntu (mode 0600, not through become) - claude-signal needs
+      # read access to load it.
+      ansible.builtin.file:
+        path: /tmp/sandbox-image.tar
+        mode: "0644"
+      when: sandbox_image_check.rc != 0
+
+    - name: podman load the image
+      become_user: claude-signal
+      ansible.builtin.command:
+        cmd: podman load -i /tmp/sandbox-image.tar
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ claude_signal_uid.stdout }}"
+      when: sandbox_image_check.rc != 0
+
+    - name: Remove the image tarball from the ai instance once loaded
+      ansible.builtin.file:
+        path: /tmp/sandbox-image.tar
+        state: absent
+      when: sandbox_image_check.rc != 0
+
+- name: Configure the ai instance
+  hosts: ai
+  become: true
+  roles:
+    - ai
+
+- name: Configure the deploy instance
+  hosts: deploy
+  become: true
+  roles:
+    - deploy

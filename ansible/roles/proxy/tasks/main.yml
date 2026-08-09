@@ -1,0 +1,236 @@
+---
+- name: Install proxy packages
+  ansible.builtin.apt:
+    name:
+      - squid
+      - openjdk-25-jre-headless   # signal-cli 0.14.x needs Java 25 specifically
+      - curl
+      - python3
+      - podman   # builds the ai instance's sandbox container image - real internet
+                 # access here avoids needing Docker Hub's several pull-path domains
+                 # allowed through Squid; the built image is relayed to ai instead
+      - nginx    # reverse-proxies public port 80 to the deploy instance, gated open/
+                 # closed by claude-signal-web-gate.sh - see network.tf for why the
+                 # security group leaves the port always reachable
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Configure automatic security updates
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/roles/common/tasks/auto_updates.yml"
+
+- name: Check for existing signal-cli install
+  ansible.builtin.stat:
+    path: /opt/signal-cli/bin/signal-cli
+  register: signal_cli_bin
+
+- name: Ensure /opt/signal-cli exists
+  ansible.builtin.file:
+    path: /opt/signal-cli
+    state: directory
+    mode: "0755"
+  when: not signal_cli_bin.stat.exists
+
+- name: Look up latest signal-cli release metadata
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/AsamK/signal-cli/releases/latest
+    return_content: true
+  register: signal_cli_release
+  when: not signal_cli_bin.stat.exists
+
+- name: Determine signal-cli download URL
+  # The release has several .tar.gz assets (json-schemas, Linux-native, Linux-client,
+  # the plain JRE-based one). We want the plain signal-cli-X.Y.Z.tar.gz - no extra
+  # hyphenated suffix before the version's trailing .tar.gz.
+  ansible.builtin.set_fact:
+    signal_cli_download_url: >-
+      {{ signal_cli_release.json.assets
+         | selectattr('browser_download_url', 'match', '^.*/signal-cli-[0-9.]+\.tar\.gz$')
+         | map(attribute='browser_download_url') | first }}
+  when: not signal_cli_bin.stat.exists
+
+- name: Download signal-cli
+  ansible.builtin.get_url:
+    url: "{{ signal_cli_download_url }}"
+    dest: /tmp/signal-cli.tar.gz
+    mode: "0644"
+  when: not signal_cli_bin.stat.exists
+
+- name: Extract signal-cli
+  ansible.builtin.unarchive:
+    src: /tmp/signal-cli.tar.gz
+    dest: /opt/signal-cli
+    remote_src: true
+    extra_opts:
+      - --strip-components=1
+  when: not signal_cli_bin.stat.exists
+
+- name: Remove downloaded signal-cli tarball
+  ansible.builtin.file:
+    path: /tmp/signal-cli.tar.gz
+    state: absent
+  when: not signal_cli_bin.stat.exists
+
+- name: Deploy signal_bridge.py
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/proxy/signal_bridge.py"
+    dest: /opt/claude-signal/signal_bridge.py
+    owner: claude-signal
+    group: claude-signal
+    mode: "0750"
+  notify: restart signal-bridge
+
+- name: Deploy approval_daemon.py
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/proxy/approval_daemon.py"
+    dest: /opt/claude-signal/approval_daemon.py
+    owner: claude-signal
+    group: claude-signal
+    mode: "0750"
+  notify: restart approval-daemon
+
+- name: Deploy idle_monitor.py
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/proxy/idle_monitor.py"
+    dest: /opt/claude-signal/idle_monitor.py
+    owner: claude-signal
+    group: claude-signal
+    mode: "0750"
+  notify: restart idle-monitor
+
+# GITHUB_TOKEN is deliberately NOT kept in group_vars/all.yml - the user sets it by
+# SSHing into the box directly (never pasted into chat/session, same rule as every
+# other credential here). If group_vars doesn't define github_token, preserve
+# whatever is already in the live env file instead of templating an empty value
+# over it. no_log on both tasks so the token never appears in Ansible output/logs.
+- name: Check for an existing GITHUB_TOKEN already set on the server
+  ansible.builtin.command: grep -h '^GITHUB_TOKEN=' /etc/claude-signal/env
+  register: existing_github_token
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Preserve an existing on-server GITHUB_TOKEN if group_vars doesn't define one
+  ansible.builtin.set_fact:
+    effective_github_token: >-
+      {{ github_token if (github_token | default('') | length > 0)
+         else (existing_github_token.stdout.split('=', 1)[1] if existing_github_token.rc == 0 else '') }}
+  no_log: true
+
+- name: Template proxy env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: /etc/claude-signal/env
+    owner: root
+    group: claude-signal
+    mode: "0640"
+  notify:
+    - restart signal-bridge
+    - restart approval-daemon
+    - restart idle-monitor
+  no_log: true  # RELAY_SECRET, STOP_SECRET, GITHUB_TOKEN all render into this file
+
+- name: Seed allowlist state (only if missing - live runtime state, never overwritten)
+  ansible.builtin.copy:
+    content: "{}"
+    dest: /etc/claude-signal/allowlist.json
+    owner: claude-signal
+    group: claude-signal
+    mode: "0640"
+    force: false
+
+- name: Seed Squid allowlist file (only if missing - live runtime state, never overwritten)
+  ansible.builtin.copy:
+    content: ""
+    dest: /etc/squid/allowed_domains.txt
+    owner: claude-signal
+    group: claude-signal
+    mode: "0644"
+    force: false
+
+- name: Render squid.conf
+  ansible.builtin.template:
+    src: squid.conf.j2
+    dest: /etc/squid/squid.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/squid -k parse -f %s
+  notify: restart squid
+
+- name: Template the web-gate toggle script
+  ansible.builtin.template:
+    src: claude-signal-web-gate.sh.j2
+    dest: /usr/local/sbin/claude-signal-web-gate
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install sudoers rule for squid reconfigure + web gate toggling (claude-signal may run nothing else)
+  ansible.builtin.copy:
+    src: claude-signal.sudoers
+    dest: /etc/sudoers.d/claude-signal
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Seed the web gate state as closed (only if missing - live runtime state, never overwritten)
+  ansible.builtin.copy:
+    content: |
+      return 503 "closed\n";
+    dest: /etc/claude-signal/web_gate_state.conf
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+
+- name: Template the nginx web-gate site
+  ansible.builtin.template:
+    src: claude-signal-web.nginx.j2
+    dest: /etc/nginx/sites-available/claude-signal-web.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload nginx
+
+- name: Disable the default nginx site (would otherwise also claim port 80)
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx
+
+- name: Enable the claude-signal-web nginx site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/claude-signal-web.conf
+    dest: /etc/nginx/sites-enabled/claude-signal-web.conf
+    state: link
+  notify: reload nginx
+
+- name: Install proxy systemd units
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../server/proxy/systemd/{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - claude-signal-signal-cli-daemon.service
+    - claude-signal-signal-bridge.service
+    - claude-signal-approval-daemon.service
+    - claude-signal-idle-monitor.service
+  notify: daemon-reload
+
+- name: Enable and start Squid and the proxy daemons
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop:
+    - squid
+    - nginx
+    - claude-signal-approval-daemon
+    - claude-signal-signal-cli-daemon
+    - claude-signal-signal-bridge
+    - claude-signal-idle-monitor
