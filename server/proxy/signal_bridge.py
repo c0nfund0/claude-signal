@@ -46,6 +46,12 @@ RELAY_SECRET = os.environ["RELAY_SECRET"]
 RELAY_PORT = os.environ.get("RELAY_PORT", "8443")
 AI_PRIVATE_IP = os.environ["AI_PRIVATE_IP"]
 CONTROLLER_URL = os.environ["CONTROLLER_URL"]
+# Both empty by default - the CS2 integration is opt-in (see README's "CS2 game
+# server integration" section). CS2_SSH_HOSTNAME is the synthetic /etc/hosts name
+# (see the proxy role's "Add /etc/hosts entry for the CS2 server" task) that Squid's
+# domain allowlist gates SSH access to, exactly like any other domain.
+CS2_CONTROLLER_URL = os.environ.get("CS2_CONTROLLER_URL", "")
+CS2_SSH_HOSTNAME = os.environ.get("CS2_SSH_HOSTNAME", "")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "7801"))
 LOCAL_ADMIN_PORT = os.environ.get("LOCAL_ADMIN_PORT", "7802")
 SIGNAL_CLI_SOCKET = os.environ.get("SIGNAL_CLI_SOCKET", "/run/claude-signal/signal-cli.sock")
@@ -244,6 +250,9 @@ HELP_RE = re.compile(r"^help$", re.IGNORECASE)
 WEB_RE = re.compile(r"^web$", re.IGNORECASE)
 OPEN_RE = re.compile(r"^open$", re.IGNORECASE)
 CLOSE_RE = re.compile(r"^close$", re.IGNORECASE)
+CS2_RE = re.compile(r"^cs2$", re.IGNORECASE)
+CS2_OPEN_RE = re.compile(r"^cs2 open(?:\s+(permanent|forever|\d+[mhd]))?$", re.IGNORECASE)
+CS2_CLOSE_RE = re.compile(r"^cs2 close$", re.IGNORECASE)
 
 # Kept as one source of truth so `help` can't drift from what's actually wired up -
 # update this whenever a command is added or changed, rather than writing a second,
@@ -261,6 +270,9 @@ url - the controller URL that starts both instances if they're stopped
 web - start the deploy/web instance, and show what's currently deployed
 open - make the deployed site reachable at http://<proxy public ip>/
 close - stop forwarding public traffic to the deployed site (default state)
+cs2 - show the CS2 server's start URL and whether Claude currently has SSH access to it
+cs2 open [permanent|1h|30m|2d] - grant Claude SSH access to the CS2 server (default: 1h)
+cs2 close - revoke Claude's SSH access to the CS2 server (default state)
 help - this message
 
 Anything else is sent to Claude as a chat message."""
@@ -361,6 +373,50 @@ def handle_close():
         signal_send(f"Couldn't close: {exc}")
 
 
+def handle_cs2():
+    if not CS2_SSH_HOSTNAME:
+        signal_send("CS2 integration isn't configured on this deployment.")
+        return
+    try:
+        result = admin_call("GET", "/allowlist")
+        allowlist_text = result.get("message", "")
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"Couldn't reach the allowlist: {exc}")
+        return
+    gate_line = next(
+        (line for line in allowlist_text.splitlines() if line.startswith(f"{CS2_SSH_HOSTNAME}:")),
+        f"{CS2_SSH_HOSTNAME}: not allowed (closed)",
+    )
+    lines = [gate_line]
+    if CS2_CONTROLLER_URL:
+        lines.append(f"Start URL (if the CS2 server is stopped): {CS2_CONTROLLER_URL}")
+    signal_send("\n".join(lines))
+
+
+def handle_cs2_open(qualifier):
+    if not CS2_SSH_HOSTNAME:
+        signal_send("CS2 integration isn't configured on this deployment.")
+        return
+    try:
+        result = admin_call(
+            "POST", "/allowlist/allow", {"domain": CS2_SSH_HOSTNAME, "qualifier": qualifier},
+        )
+        signal_send(result.get("message", "done"))
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"Couldn't open CS2 access: {exc}")
+
+
+def handle_cs2_close():
+    if not CS2_SSH_HOSTNAME:
+        signal_send("CS2 integration isn't configured on this deployment.")
+        return
+    try:
+        result = admin_call("POST", "/allowlist/block", {"domain": CS2_SSH_HOSTNAME})
+        signal_send(result.get("message", "done"))
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"Couldn't close CS2 access: {exc}")
+
+
 def handle_message(text):
     text = text.strip()
 
@@ -440,6 +496,19 @@ def handle_message(text):
 
     if CLOSE_RE.match(text):
         handle_close()
+        return
+
+    m = CS2_OPEN_RE.match(text)
+    if m:
+        handle_cs2_open(m.group(1))
+        return
+
+    if CS2_CLOSE_RE.match(text):
+        handle_cs2_close()
+        return
+
+    if CS2_RE.match(text):
+        handle_cs2()
         return
 
     # handle_message() itself already runs off the reader thread (see

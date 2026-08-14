@@ -148,6 +148,18 @@
     mode: "0644"
     force: false
 
+- name: Add /etc/hosts entry for the CS2 server (optional integration - see README)
+  # Squid's dstdomain ACL treats this exactly like any other domain (allow/block-able,
+  # timed or permanent) once it's resolvable - no Squid config changes needed beyond
+  # this host mapping. cs2_private_ip is the CS2 instance's private IP, same VPC, so
+  # this never touches the public internet or needs an Elastic IP on either side.
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ cs2_private_ip }} {{ cs2_ssh_hostname | default('cs2-server.internal') }}"
+    regexp: "^[0-9.]+\\s+{{ cs2_ssh_hostname | default('cs2-server.internal') }}$"
+    state: present
+  when: cs2_private_ip is defined and cs2_private_ip | length > 0
+
 - name: Render squid.conf
   ansible.builtin.template:
     src: squid.conf.j2

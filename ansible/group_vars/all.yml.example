@@ -57,3 +57,12 @@ claude_code_oauth_token: ""
 #     account - same rule as the Claude token above: never commit a real value, set
 #     by hand over SSH on the server itself, not pasted into chat. ---
 github_token: ""
+
+# --- Optional CS2 game server integration (see README's "CS2 game server
+#     integration" section) - leave all three commented out/unset to skip it
+#     entirely; nothing else in this file depends on it. ---
+# cs2_private_ip: "172.31.128.xxx"          # from ../CS2Server's `terraform output`
+# cs2_controller_url: "https://yyyyyyyyyy.execute-api.eu-north-1.amazonaws.com/"
+# cs2_ssh_hostname: "cs2-server.internal"   # synthetic hostname, gated like any other
+#                                            # Squid-allowlisted domain - not a real DNS
+#                                            # name, just an /etc/hosts entry on the proxy

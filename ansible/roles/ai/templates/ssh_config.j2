@@ -7,3 +7,15 @@ Host github.com
     User git
     ProxyCommand corkscrew {{ proxy_private_ip }} {{ squid_port }} %h %p
     StrictHostKeyChecking accept-new
+{% if cs2_ssh_hostname is defined and cs2_ssh_hostname %}
+
+# Optional CS2 game server integration (see README) - a separate, dedicated key from
+# the github.com one above, so a leak of either key never grants the other. Gated by
+# the same Squid allowlist mechanism, toggled via the "cs2 open"/"cs2 close" Signal
+# commands or request_url_access - see CS2_POLICY_PROMPT in claude_wrapper.py.
+Host {{ cs2_ssh_hostname }}
+    User steam
+    IdentityFile ~/.ssh/id_ed25519_cs2
+    ProxyCommand corkscrew {{ proxy_private_ip }} {{ squid_port }} %h %p
+    StrictHostKeyChecking accept-new
+{% endif %}

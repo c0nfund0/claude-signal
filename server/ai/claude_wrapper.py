@@ -65,6 +65,11 @@ CLAUDE_DISALLOWED_TOOLS = os.environ.get("CLAUDE_DISALLOWED_TOOLS", "Bash(git pu
 # would need 4.x). Simpler to just not need cross-boundary file access at all.
 SESSION_FILE = os.environ.get("SESSION_FILE", "/opt/claude-signal/session_id")
 CLAUDE_TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "900"))
+# Both empty unless the optional CS2 integration is configured (see README) - in that
+# case CS2_SSH_HOSTNAME is the synthetic /etc/hosts name that Squid's domain allowlist
+# gates SSH access to, and CS2_POLICY_PROMPT below is only appended when it's set.
+CS2_SSH_HOSTNAME = os.environ.get("CS2_SSH_HOSTNAME", "")
+CS2_CONTROLLER_URL = os.environ.get("CS2_CONTROLLER_URL", "")
 
 state_lock = threading.Lock()
 state = {"busy": False, "last_activity": time.time(), "recent": collections.deque(maxlen=8)}
@@ -116,6 +121,32 @@ GIT_POLICY_PROMPT = (
     "Dockerfile at its root that listens on $PORT."
 )
 
+# Only appended when CS2_SSH_HOSTNAME is actually configured (see run_claude() below) -
+# deployments without the optional CS2 integration set up should see no reference to
+# it at all. Unlike everything else in this file, SSH access to the CS2 box is a real,
+# unrestricted interactive shell once granted - not a single gated action - so the
+# guidance here is about judgment and care, not a hard mechanical rule.
+CS2_POLICY_PROMPT_TEMPLATE = (
+    "There is also a separate CS2 (Counter-Strike 2) game server, unrelated to this "
+    "machine, source at github.com/c0nfund0/cs2server (clone/push it exactly like any "
+    "other c0nfund0 repo - already works). SSH access to it is gated the same way as "
+    "any other blocked URL: try `ssh {hostname}` (logs in as the `steam` user); if it "
+    "fails (connection refused/timeout - not a normal SSH error), call "
+    "request_url_access with that hostname and wait for approval, or tell the user to "
+    "send 'cs2 open' on Signal. Once connected you have a normal interactive shell as "
+    "`steam` on the actual game server box - this is NOT a sandboxed action like "
+    "everything else here, be careful. To deploy a plugin change: clone or pull the "
+    "cs2server repo ON THAT BOX (it already has full internet access and the .NET SDK "
+    "- don't build in your own sandbox and copy binaries over), `dotnet build -c "
+    "Release` under plugin/<Name>/, copy the 3 build output files (.dll/.deps.json/"
+    ".pdb) into <cs2 install>/game/csgo/addons/counterstrikesharp/plugins/<Name>/, "
+    "then `sudo systemctl restart cs2-server` (passwordless, but scoped to exactly "
+    "that command - nothing else needs sudo). This is a real server other people may "
+    "be actively playing on right now - avoid restarting it without being reasonably "
+    "confident that's fine, and always tell the user in your reply if you restarted "
+    "it. The controller URL to start the CS2 instance if it's stopped is: {url}"
+)
+
 # Purely a tone/flavor layer - never allowed to affect substance. See the last two
 # sentences below, which exist specifically to stop the persona from ever degrading
 # actual task quality (especially coding correctness), which is the whole point of
@@ -154,6 +185,12 @@ DEFAULT_PERSONA_PROMPT = (
 # string (e.g. a templated env file that always renders the key) must still fall back
 # to the default, not silently disable the persona.
 PERSONA_PROMPT = os.environ.get("CLAUDE_PERSONA_PROMPT") or DEFAULT_PERSONA_PROMPT
+
+SYSTEM_PROMPT = PERSONA_PROMPT + "\n\n" + NETWORK_POLICY_PROMPT + "\n\n" + GIT_POLICY_PROMPT
+if CS2_SSH_HOSTNAME:
+    SYSTEM_PROMPT += "\n\n" + CS2_POLICY_PROMPT_TEMPLATE.format(
+        hostname=CS2_SSH_HOSTNAME, url=CS2_CONTROLLER_URL or "(not configured)",
+    )
 
 
 def _text(value):
@@ -212,7 +249,7 @@ def run_claude(text):
            "--permission-mode", "acceptEdits",
            "--allowedTools", CLAUDE_ALLOWED_TOOLS,
            "--disallowedTools", CLAUDE_DISALLOWED_TOOLS,
-           "--append-system-prompt", PERSONA_PROMPT + "\n\n" + NETWORK_POLICY_PROMPT + "\n\n" + GIT_POLICY_PROMPT]
+           "--append-system-prompt", SYSTEM_PROMPT]
     session_id = load_session_id()
     if session_id:
         cmd += ["--resume", session_id]

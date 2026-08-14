@@ -78,6 +78,9 @@ the details.
    token blank.
 8. **Fill in `terraform.tfvars` and `ansible/group_vars/all.yml`** with everything
    from steps 1–7, then run the Ansible playbook. See [Ansible](#ansible-ansible).
+9. **(Optional, only if you also run the sibling CS2Server project) a dedicated SSH
+   keypair for CS2 access.** See
+   [CS2 game server integration](#cs2-game-server-integration-optional).
 
 Everything else (packages, daemons, Squid, the sandbox container, the Node.js/Claude
 Code bundle) is handled by Ansible.
@@ -289,6 +292,66 @@ all — the MCP tools simply won't be offered to Claude, and the underlying `Bas
 push*)` block stays in place regardless (see
 [Credential architecture](#credential-architecture)).
 
+## CS2 game server integration (optional)
+
+A separate, sibling Terraform project (`../CS2Server` — not part of this repo) runs a
+Counter-Strike 2 dedicated server on its own EC2 instance, in the same AWS
+account/default VPC as claude-signal, with its own start/stop Lambda + API Gateway
+URL. This integration, if you set it up, lets the bot know that URL and gives it real,
+time-boxed **interactive SSH access** to that box so it can pull plugin source from
+GitHub, build, and deploy changes itself.
+
+This is a deliberate exception to how every other privileged capability in this
+project works. Everywhere else (git push, repo creation, web deploy), a credential
+that can act is kept off the ai instance entirely and the action is relayed through
+the proxy instead — see [Credential architecture](#credential-architecture) — so
+Claude only ever gets a yes/no answer, never the thing that could act on its own. Here
+the ask was different: a real, unrestricted shell on the CS2 box, not one discrete
+approvable action per change. That means the SSH private key genuinely has to live
+somewhere Claude can use it directly (the sandbox), which is exactly the situation
+avoided everywhere else in this project. Skip this whole section if that tradeoff
+isn't one you want — everything else here works identically without it.
+
+**How it's gated**: access is off by default. `cs2 open [permanent|1h|30m|2d]` on
+Signal (default 1h) or Claude calling the existing `request_url_access` tool itself
+(if you ask it to do CS2 work and access isn't currently open) grants SSH reach to the
+CS2 box through the same Squid domain-allowlist mechanism already used for everything
+else — nothing CS2-specific was added to Squid or `approval_daemon.py` for this.
+`cs2 close` (or just letting a timed grant expire) revokes it. `cs2` alone shows the
+CS2 controller URL and whether access is currently open.
+
+**Setup** (all manual, one-time):
+
+1. In `../CS2Server`, set `enable_claude_signal_ssh = true` in its `terraform.tfvars`
+   and `terraform apply` — adds one security-group rule allowing SSH from this
+   project's proxy instance. See that repo's own README for the corresponding setup
+   on its side (the sudoers rule, the keypair, the CS2-side steps below).
+2. Generate a **dedicated** keypair just for this (`ssh-keygen -t ed25519 -f
+   cs2-deploy-key -N ""`) — deliberately separate from the GitHub deploy key, so a
+   leak of one credential never grants the other.
+3. Append the public half to the `steam` user's `authorized_keys` on the CS2 instance,
+   and install the narrow sudoers rule from `../CS2Server/server/claude-cs2-deploy.sudoers`
+   there (`steam` can passwordlessly restart/check the `cs2-server` service — nothing
+   else) — see that repo's README for the exact commands.
+4. Place the **private** half at `/opt/claude-signal/sandbox-home/.ssh/id_ed25519_cs2`
+   on the ai instance (owned `200999:200999`, mode `0600`) — same manual placement as
+   the GitHub key, never through Ansible/`group_vars`.
+5. Fill in `cs2_private_ip` (from `../CS2Server`'s `terraform output`),
+   `cs2_controller_url` (its `server_url` output), and optionally `cs2_ssh_hostname`
+   (defaults to `cs2-server.internal` if left unset — a synthetic name, not a real
+   domain, that only exists as an `/etc/hosts` entry on the proxy) in
+   `ansible/group_vars/all.yml`, then re-run `ansible-playbook playbook.yml`.
+
+Once connected, Claude has a normal shell as `steam` — the same user that owns the
+CS2 install, so it can read the RCON password (`/etc/cs2/server.env`, group-readable
+by `steam`) and use RCON directly, not just edit files. It's told (via a system
+prompt addition, only present when this is configured) to build plugin changes **on
+the CS2 box itself** rather than in its own sandbox — that box already has the .NET
+SDK and full internet access, per `../CS2Server`'s own setup — copy the build output
+into the right `addons/counterstrikesharp/plugins/<Name>/` folder, and
+`sudo systemctl restart cs2-server` to apply it, with a reminder that this is a real
+server other people might be actively playing on.
+
 ## Why a Squid proxy instead of AWS Network Firewall
 
 AWS does have built-in domain-allowlisting for exactly this use case — **AWS Network
@@ -433,6 +496,9 @@ send `open`/`close` on Signal.
 | `web` | Start the proxy+deploy instances and show what's currently deployed, plus the site's URL. |
 | `open` | Make the currently-deployed site reachable at `http://<proxy public ip>/`. |
 | `close` | Stop forwarding public traffic to the deployed site (default state). |
+| `cs2` | Show the CS2 server's start URL and whether Claude currently has SSH access to it. Only useful if [CS2 integration](#cs2-game-server-integration-optional) is configured. |
+| `cs2 open [permanent\|1h\|30m\|2d]` | Grant Claude SSH access to the CS2 server (default: 1h). |
+| `cs2 close` | Revoke Claude's SSH access to the CS2 server (default state). |
 | `help` | Print this list. |
 | *(anything else)* | Sent to Claude Code as a chat message. |
 
@@ -468,6 +534,7 @@ would let it bypass the approval gates:
 | `GITHUB_TOKEN` | proxy (repo creation via the GitHub API) and deploy (cloning the repo being deployed) | ai instance, the sandbox container, and therefore Claude Code itself | Confirmed live during development that `claude mcp add --env GITHUB_TOKEN=...` persists whatever it's given in plaintext in `~/.claude.json`, inside the sandbox's own bind-mounted home directory — trivially readable by the same `coder` user Claude runs as. That would let Claude read the token directly and hit the GitHub API on its own, bypassing the entire approval gate. So repo creation and deploy are both *relays*: the ai-side MCP tools only ever ask `approval_daemon` for a yes/no and, once approved, ask it to perform the privileged action server-side — they never receive or hold the credential that does it. |
 | `STOP_SECRET` | proxy (idle_monitor), Lambda | ai, deploy | Only needed to call the Lambda's `/stop` route. |
 | SSH deploy key (for `git push`) | ai instance's `sandbox-home/.ssh` | proxy, deploy | The sandbox pushes over SSH directly; this key can (by GitHub's own scoping) push, but the *decision* to push is still gated by `request_git_push` refusing to run `git push` unless `approval_daemon` has already recorded an approval for that exact request id. |
+| CS2 SSH key (optional, see [CS2 integration](#cs2-game-server-integration-optional)) | ai instance's `sandbox-home/.ssh` | proxy, deploy | **The one deliberate exception to this table's whole pattern.** Every other row above keeps the credential *out* of the sandbox specifically so Claude never holds something that could bypass a gate on its own. Here that's the point: the feature is Claude getting a real interactive shell, not one relayed action, so the key has to be somewhere Claude can use it directly. What's still gated is *network reach* to use it at all (the Squid allowlist, toggled by `cs2 open`/`cs2 close` or `request_url_access`) — not the key itself. |
 
 ## `apt` on the ai and deploy instances
 
