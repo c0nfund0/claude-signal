@@ -7,6 +7,13 @@ server {
     listen [::]:80 default_server;
     server_name _;
 
+    # Always reachable regardless of gate state - certbot's HTTP-01 challenge for
+    # app_domain's cert (see claude-signal-web-ssl.nginx.j2 and main.yml's certbot
+    # task) needs this whether the site is currently open or closed.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
     location / {
         include /etc/claude-signal/web_gate_state.conf;
     }

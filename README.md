@@ -392,6 +392,7 @@ fetched *on the proxy* and relayed over the private network, or routed through S
 | `server/ai/mcp_url_gate.py` | ai (inside the sandbox) | Minimal hand-rolled MCP stdio server exposing `request_url_access(url)` - posts to the proxy's public approval endpoint and polls until approved/denied/timeout (10 min). |
 | `server/ai/mcp_git_gate.py` | ai (inside the sandbox) | Minimal hand-rolled MCP stdio server exposing `request_git_push` and `request_repo_create` - same approval-then-poll pattern, routed through `approval_daemon`'s `/request-git-action`. Never holds `GITHUB_TOKEN`. See [Git push & deploy](#git-push--deploy) below. |
 | `server/deploy/deploy_wrapper.py` | deploy | `POST /deploy {"repo", "branch"}` - clean re-clone + `podman build` + `podman run` of whatever's at the repo's root `Containerfile`/`Dockerfile`. Only ever called by `approval_daemon`'s `/deploy-trigger` relay, after a Signal approval. `GET /status` reports what's currently deployed. |
+| `server/proxy/voice_pipeline.py` | proxy (its own virtualenv) | One-shot STT/TTS helper for voice messages - `transcribe`/`synthesize` subcommands, invoked as a subprocess per voice note rather than run as a daemon. See [Voice messages](#voice-messages) below. |
 
 **Checking in on Claude while it's working**: send `status` on Signal - it replies with busy/idle plus the last several tool calls / thinking / text blocks from the current or most recent run, so you're not left guessing whether it's stuck or just working on something slow.
 
@@ -481,6 +482,73 @@ send `open`/`close` on Signal.
 - `open` — start forwarding public traffic to the deployed container.
 - `close` — go back to refusing with 503 (the default state).
 
+When open, the proxy also forwards WebSocket upgrades through to the deployed
+container (`proxy_http_version 1.1` plus `Upgrade`/`Connection` headers driven by a
+`$connection_upgrade` map, defined once at the `http {}` level in
+`ansible/roles/proxy/templates/claude-signal-websocket-map.nginx.j2` since `map` isn't
+valid inside the per-site server block) — a deployed app can use `ws://`/`wss://` on
+the same port 80 without any extra setup. `proxy_read_timeout` is set to `3600s` so
+nginx doesn't kill an idle WebSocket connection at its 60s default.
+
+### Custom domain (single-link start)
+
+By default, viewing the deployed site takes three manual steps: hit the controller
+URL's `/web` route to start the proxy+deploy instances, send `open` on Signal, then
+find the proxy's current public IP (`/status`, since it changes every start). Setting
+`web_domain` and `app_domain` collapses all three into one link.
+
+- **`web_domain`** (e.g. `web.example.com`) — an API Gateway custom domain mapped to
+  the same Lambda controller. Visiting it starts proxy+deploy, then the page's own JS
+  polls `/status` until both are `running`, calls the Lambda's `/open` route, and
+  redirects the browser to `https://<app_domain>/`. No secret required to visit it —
+  same posture the plain `/web` link already had (see
+  [Known limitations](#known-limitations)); a real domain name is just easier to find
+  than a random `execute-api.amazonaws.com` URL, since ACM logs it publicly to
+  Certificate Transparency the moment the cert issues.
+- **`app_domain`** (e.g. `app.example.com`) — the actual site. Terraform allocates a
+  stable Elastic IP for the proxy instance (so this domain, once pointed at it, never
+  needs updating again) and the proxy's own nginx terminates HTTPS for it with a
+  Let's Encrypt certificate. This is the same gate as before (`open`/`close` on
+  Signal, or the auto-open above) — `web_domain` doesn't bypass it, it just automates
+  the `open` step instead of requiring you to send it separately.
+
+The `/open` call between them carries `WEB_OPEN_SECRET` (see
+[Credential architecture](#credential-architecture)) from Lambda to
+`https://<app_domain>/_claude-signal/open`, a path deliberately outside the gated
+`location /` block in nginx so it works even while the gate is closed — that's the
+chicken-and-egg it exists to solve. `approval_daemon.py`'s `WebOpenHandler` (bound
+`127.0.0.1` only, reached solely via that nginx location) checks the secret and runs
+the same `claude-signal-web-gate open` script the Signal `open` command does, then
+posts a Signal notification so opening the site is never silent even when nobody sent
+the command themselves.
+
+**Setup** (both domains optional — set neither and nothing here changes):
+
+1. In `terraform.tfvars`, set `web_domain`, `app_domain`, and `web_open_secret`
+   (`openssl rand -hex 32`); in `ansible/group_vars/all.yml`, set the *same*
+   `app_domain` and `web_open_secret` values. `letsencrypt_email` is optional —
+   only used for Let's Encrypt renewal-failure notices; leave it unset to register
+   with `--register-unsafely-without-email` instead.
+2. `terraform apply` — this creates the ACM certificate for `web_domain` but can't
+   finish validating it yet (DNS is managed outside this AWS account/Terraform config
+   — see the note in `acm.tf`).
+3. Add the validation record from `terraform output web_domain_validation_records` at
+   your DNS provider, wait for it to propagate, then `terraform apply` again — this
+   time it finishes issuing the cert and creates the custom domain mapping.
+4. Add a CNAME: `web_domain` → `terraform output web_domain_cname_target`.
+5. Add an A record: `app_domain` → `terraform output proxy_eip`.
+6. Run `ansible-playbook` — this is what actually requests the `app_domain` Let's
+   Encrypt certificate (via HTTP-01/webroot, so `app_domain`'s A record needs to be
+   live *before* this step) and wires up the HTTPS site and the open-trigger.
+
+Certbot's own renewal timer runs twice daily but only while the proxy happens to be
+running — since `idle_monitor` stops it after `idle_seconds` of inactivity, a rarely
+visited deployment could in principle miss every scheduled renewal window before the
+90-day cert expires. A renewal attempt also runs once at boot (see
+`claude-signal-certbot-renew.service`) as a second chance, which is a no-op unless
+within 30 days of expiry — but if the box genuinely goes unused for ~3 months
+straight, expect to just SSH in and run `sudo certbot renew` by hand afterward.
+
 ### Signal commands
 
 | Command | Does |
@@ -494,13 +562,59 @@ send `open`/`close` on Signal.
 | `reset` | Clear the saved conversation. Also needed after changing the persona or any other system-prompt content — see the note below on why. |
 | `url` | The controller URL that starts the proxy+ai instances if they're stopped. |
 | `web` | Start the proxy+deploy instances and show what's currently deployed, plus the site's URL. |
-| `open` | Make the currently-deployed site reachable at `http://<proxy public ip>/`. |
+| `open` | Make the currently-deployed site reachable at `http://<proxy public ip>/` (or `https://<app_domain>/` if [configured](#custom-domain-single-link-start)). |
 | `close` | Stop forwarding public traffic to the deployed site (default state). |
 | `cs2` | Show the CS2 server's start URL and whether Claude currently has SSH access to it. Only useful if [CS2 integration](#cs2-game-server-integration-optional) is configured. |
 | `cs2 open [permanent\|1h\|30m\|2d]` | Grant Claude SSH access to the CS2 server (default: 1h). |
 | `cs2 close` | Revoke Claude's SSH access to the CS2 server (default state). |
 | `help` | Print this list. |
 | *(anything else)* | Sent to Claude Code as a chat message. |
+
+### Voice messages
+
+Signal itself can't do live phone/video calls here — `signal-cli` (the library the
+bot's whole identity is built on) has never implemented Signal's WebRTC calling
+protocol ([AsamK/signal-cli#1735](https://github.com/AsamK/signal-cli/issues/1735),
+open since 2023). What *is* fully supported is Signal's normal voice-note attachment
+(the microphone button in the Signal app), since that's just a message with an audio
+file attached — no different from an image or a document as far as signal-cli is
+concerned. So instead of a live call, send a voice note:
+
+1. **STT**: `signal_bridge.py` notices an incoming attachment flagged `isVoiceNote`
+   (or any plain `audio/*` attachment), and hands the file straight to
+   `voice_pipeline.py transcribe` — a thin wrapper around
+   [faster-whisper](https://github.com/SYSTRAN/faster-whisper), the same STT engine
+   the sibling `aivoiceassistant` (`vassist`) project uses, run as a one-shot
+   subprocess in its own virtualenv (`/opt/claude-signal/voice-venv`) rather than a
+   resident daemon — see the comment at the top of `voice_pipeline.py` for why (short
+   version: a t3.small proxy has 2GB RAM and already runs several other daemons plus
+   signal-cli's JVM, and voice messages are rare enough that a few seconds of model
+   load per message beats a permanently resident model). Both STT and TTS are pinned
+   to English (`language="en"` passed straight to faster-whisper, skipping its
+   language-ID step entirely) — auto-detection was unreliable on short voice notes,
+   confirmed live misdetecting English speech as Finnish.
+2. You get back an immediate `Heard: "..."` line so you can see the transcription
+   went right (or catch it if it didn't) before waiting on a reply.
+3. The transcript is forwarded through the exact same `claude_wrapper.py` relay as a
+   typed message — same session, same persona, same approval gates — with one small
+   addition to that turn's prompt text (not the system prompt, so it applies even
+   mid-session on a `--resume`d conversation): asking Claude to close its answer with
+   a line starting `TL;DR:` containing a 1-2 sentence, plain-language, speakable
+   summary.
+4. The full reply is sent back as a normal text message, exactly as always.
+5. The `TL;DR:` line (or a crude first-two-sentences fallback if Claude doesn't
+   follow the format) is synthesized with `voice_pipeline.py synthesize`, using
+   [edge-tts](https://github.com/rany2/edge-tts) (Microsoft's neural voices — needs
+   the proxy's real internet access, which it already has), and sent back as a
+   voice-note reply.
+
+Nothing here touches the ai instance's isolation — the whole pipeline runs on the
+proxy, using the same HTTP relay to `claude_wrapper.py` that text messages already
+use. `voice_stt_model` (`base` by default; `tiny`/`small`/`medium`/`large-v3` are all
+valid faster-whisper sizes) and `voice_timeout_seconds` (`120`) are set in
+`group_vars/all.yml` — bump the model size only if you've confirmed the proxy has
+memory to spare, since `base` was chosen specifically to fit comfortably on a
+t3.small alongside everything else already running there.
 
 ### Persona
 
@@ -533,6 +647,7 @@ would let it bypass the approval gates:
 | `RELAY_SECRET` | proxy, ai, deploy | — | Shared bearer secret between the daemons. Its blast radius is deliberately small: on the ai side, it only reaches endpoints that can *create or poll* a request, never approve one (see `approval_daemon.py`'s two-listener split). |
 | `GITHUB_TOKEN` | proxy (repo creation via the GitHub API) and deploy (cloning the repo being deployed) | ai instance, the sandbox container, and therefore Claude Code itself | Confirmed live during development that `claude mcp add --env GITHUB_TOKEN=...` persists whatever it's given in plaintext in `~/.claude.json`, inside the sandbox's own bind-mounted home directory — trivially readable by the same `coder` user Claude runs as. That would let Claude read the token directly and hit the GitHub API on its own, bypassing the entire approval gate. So repo creation and deploy are both *relays*: the ai-side MCP tools only ever ask `approval_daemon` for a yes/no and, once approved, ask it to perform the privileged action server-side — they never receive or hold the credential that does it. |
 | `STOP_SECRET` | proxy (idle_monitor), Lambda | ai, deploy | Only needed to call the Lambda's `/stop` route. |
+| `WEB_OPEN_SECRET` | Lambda, proxy (`approval_daemon`'s `WebOpenHandler`) | ai, deploy | Optional, only used when `app_domain`/`web_domain` are set — see [Custom domain](#custom-domain-single-link-start). Sent over the internet (Lambda → `https://<app_domain>/_claude-signal/open`), so treat it like `STOP_SECRET`: low blast radius (it can only toggle the same gate `open`/`close` on Signal already toggles), but still a real secret, not just an obscurity measure. |
 | SSH deploy key (for `git push`) | ai instance's `sandbox-home/.ssh` | proxy, deploy | The sandbox pushes over SSH directly; this key can (by GitHub's own scoping) push, but the *decision* to push is still gated by `request_git_push` refusing to run `git push` unless `approval_daemon` has already recorded an approval for that exact request id. |
 | CS2 SSH key (optional, see [CS2 integration](#cs2-game-server-integration-optional)) | ai instance's `sandbox-home/.ssh` | proxy, deploy | **The one deliberate exception to this table's whole pattern.** Every other row above keeps the credential *out* of the sandbox specifically so Claude never holds something that could bypass a gate on its own. Here that's the point: the feature is Claude getting a real interactive shell, not one relayed action, so the key has to be somewhere Claude can use it directly. What's still gated is *network reach* to use it at all (the Squid allowlist, toggled by `cs2 open`/`cs2 close` or `request_url_access`) — not the key itself. |
 
@@ -617,9 +732,11 @@ update it before each run, same caveat as the [SSH access](#ssh-access) section 
   secret-protected since abuse there is more disruptive; the start routes are left
   open deliberately, matching the CS2 server project this was modeled on. Add an API
   key/secret to them too if that stops being fine.
-- The proxy instance's public IP changes on every stop/start (no Elastic IP, to keep
-  idle cost at zero) — the SSH config snippet above needs updating each time, or you
-  can add an `aws_eip` later if that becomes annoying.
+- The proxy instance's public IP changes on every stop/start by default (no Elastic
+  IP, to keep idle cost at zero) — the SSH config snippet above needs updating each
+  time. Setting `app_domain` (see [Custom domain](#custom-domain-single-link-start))
+  creates an Elastic IP as a side effect, which fixes this too even if you don't care
+  about the domain itself — a few cents/month while the instance is stopped.
 - `GITHUB_ORG` (the account/org Claude pushes to and deploys from) is a hardcoded
   default (`c0nfund0`) baked into a template and a system prompt rather than a proper
   Ansible-templated variable — see
@@ -636,3 +753,10 @@ update it before each run, same caveat as the [SSH access](#ssh-access) section 
   approval-gating boundaries (the two-listener split in `approval_daemon.py`, the
   credential placement in [Credential architecture](#credential-architecture)) are the
   parts most worth re-reading yourself before relying on them.
+- [Voice messages](#voice-messages) are turn-by-turn (record, send, wait, get a
+  reply), not a live conversation — Signal has no calling support here at all (see
+  that section). The on-disk path signal-cli stores a downloaded attachment at
+  (`<data-dir>/attachments/<id>`) is undocumented behavior inferred from signal-cli's
+  own source and community wrappers, not a stable contract from upstream — worth
+  re-checking against whatever signal-cli version you're actually running if voice
+  messages start silently failing to transcribe after a signal-cli upgrade.

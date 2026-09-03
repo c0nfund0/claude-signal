@@ -1,0 +1,9 @@
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-websocket-map.nginx.j2.
+# `map` is only valid in the http {} context, which sites-available/sites-enabled
+# aren't - this lives in conf.d (included at http level by the default nginx.conf)
+# so claude-signal-web.nginx.j2's server block can use $connection_upgrade for
+# WebSocket support on the deployed site.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}

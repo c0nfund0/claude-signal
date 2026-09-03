@@ -47,6 +47,15 @@ claude_timeout_seconds: 900
 # (T-X, from the Terminator films). Uncomment and edit to change the character.
 # claude_persona_prompt: "You are ..."
 
+# --- voice messages (see README's "Voice messages" section) ---
+# faster-whisper model size: tiny/base/small/medium/large-v3. base is the default -
+# a t3.small proxy (2GB RAM) is already running signal-cli's JVM, Squid, nginx, and
+# everything else here, so small/medium cost real, noticeable memory headroom.
+voice_stt_model: "base"
+# How long a subprocess transcribe/synthesize call may run before signal_bridge.py
+# gives up on it.
+voice_timeout_seconds: 120
+
 # --- set by hand after running `claude setup-token` on a browser-capable machine -
 #     see the "Claude Code auth" section in the main README. Never commit a real
 #     token here even though the file is gitignored - prefer ansible-vault if you
@@ -66,3 +75,17 @@ github_token: ""
 # cs2_ssh_hostname: "cs2-server.internal"   # synthetic hostname, gated like any other
 #                                            # Squid-allowlisted domain - not a real DNS
 #                                            # name, just an /etc/hosts entry on the proxy
+
+# --- Optional: single-link start via a custom domain (see README's "Custom domain"
+#     section) - leave all three unset to skip it entirely; nothing else in this
+#     file depends on it. Requires app_domain/web_open_secret to also be set as
+#     web_domain/web_open_secret in ../../terraform.tfvars (web_open_secret must be
+#     the IDENTICAL value in both places, same rule as relay_secret above). ---
+# app_domain: "app.example.com"             # must match terraform.tfvars' app_domain
+# web_open_secret: "REPLACE_ME"             # must match terraform.tfvars' web_open_secret
+# letsencrypt_email: "you@example.com"      # optional - only used for Let's Encrypt
+#                                            # renewal-failure notices, sent to Let's
+#                                            # Encrypt when the cert is first requested.
+#                                            # Leave unset/commented to register with no
+#                                            # email (--register-unsafely-without-email) -
+#                                            # never defaulted to anything on your behalf.

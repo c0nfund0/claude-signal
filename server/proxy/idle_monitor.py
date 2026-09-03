@@ -30,20 +30,30 @@ def main():
         time.sleep(POLL_SECONDS)
         try:
             bridge_status = get_json(f"http://127.0.0.1:{BRIDGE_PORT}/status")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # The bridge is local and always started with the proxy - if this fails
+            # something's actually wrong, not just "an instance is transitioning".
+            # Nothing useful to do but wait for the next tick either way.
+            print(f"bridge status check failed (unexpected): {exc}")
+            continue
+
+        try:
             ai_status = get_json(
                 f"http://{AI_PRIVATE_IP}:{RELAY_PORT}/status",
                 headers={"Authorization": f"Bearer {RELAY_SECRET}"},
             )
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            # ai instance likely stopped/stopping already, or mid-boot - nothing to do
-            print(f"status check failed (probably fine, instance transitioning): {exc}")
-            continue
+        except (urllib.error.URLError, TimeoutError, OSError):
+            # ai is stopped (or mid-boot) - e.g. a proxy+deploy-only session started
+            # via the web_domain/`/web` link, which never touches ai at all. That's
+            # not a reason to stay up forever: treat ai as idle rather than skipping
+            # the whole check, so bridge_status's own activity still governs.
+            ai_status = {"busy": False, "last_activity": 0}
 
         if ai_status.get("busy"):
             continue
 
         now = time.time()
-        idle_for = now - max(bridge_status.get("last_activity", now), ai_status.get("last_activity", now))
+        idle_for = now - max(bridge_status.get("last_activity", now), ai_status.get("last_activity", 0))
         if idle_for < IDLE_SECONDS:
             continue
 

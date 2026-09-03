@@ -21,6 +21,7 @@ deployment is reused.
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -58,6 +59,12 @@ def _load_state():
         with open(STATE_FILE) as f:
             return json.load(f)
     return {"repo": None, "branch": None, "commit": None, "deployed_at": None}
+
+
+def _data_volume(repo: str) -> str:
+    """The podman volume holding a repo's /data between deploys. Volume names
+    allow a narrower character set than repo names do."""
+    return "claude-signal-data-" + re.sub(r"[^A-Za-z0-9_.-]", "-", repo)
 
 
 def do_deploy(repo, branch):
@@ -98,6 +105,12 @@ def do_deploy(repo, branch):
         "run", "-d", "--name", CONTAINER_NAME,
         "--cap-drop=all", "--security-opt", "no-new-privileges",
         "--pids-limit=512", "--memory=512m",
+        # A *named* volume, so /data outlives the container. An image's own
+        # VOLUME directive creates an anonymous one, which the `podman rm -f`
+        # above orphans - every deploy then started the app with an empty data
+        # directory and no sign that anything had been lost. Named per repo, so
+        # deploying a different app never inherits another one's state.
+        "-v", f"{_data_volume(repo)}:/data",
         "-p", f"{HTTP_PORT}:{HTTP_PORT}",
         "-e", f"PORT={HTTP_PORT}",
         image_tag,
@@ -106,7 +119,8 @@ def do_deploy(repo, branch):
     if run.returncode != 0:
         return {"ok": False, "stage": "run", "error": (run.stdout + run.stderr)[-1500:]}
 
-    state = {"repo": repo, "branch": branch, "commit": commit, "deployed_at": time.time()}
+    state = {"repo": repo, "branch": branch, "commit": commit, "deployed_at": time.time(),
+             "data_volume": _data_volume(repo)}
     _save_state(state)
     return {"ok": True, **state}
 
@@ -116,6 +130,28 @@ def get_status():
     ps = _podman("ps", "--filter", f"name=^{CONTAINER_NAME}$", "--format", "{{.Status}}", timeout=15)
     running = bool(ps.stdout.strip())
     return {**state, "container_running": running}
+
+
+def resume_if_needed():
+    """`podman run` below carries no --restart policy, and this instance stops/
+    starts routinely (idle auto-stop, manual /stop, a fresh terraform apply) -
+    without this, the container is SIGTERM'd on every stop and never comes back,
+    silently, until someone happens to notice and redeploy. Since this process
+    itself is a systemd unit that starts on every boot, checking here is enough:
+    if the state file says something was deployed and that same container exists
+    but isn't running, just start it - no rebuild, no re-clone, identical to
+    what was last successfully deployed."""
+    state = _load_state()
+    if not state.get("repo"):
+        return
+    ps = _podman("ps", "-a", "--filter", f"name=^{CONTAINER_NAME}$", "--format", "{{.Status}}", timeout=15)
+    status = ps.stdout.strip()
+    if not status or status.startswith("Up"):
+        return  # nothing to resume (never deployed / already removed), or already running
+    print(f"resuming {state['repo']}@{state['branch']} ({state.get('commit')}) after restart: {status}")
+    result = _podman("start", CONTAINER_NAME, timeout=30)
+    if result.returncode != 0:
+        print(f"failed to resume container: {(result.stdout + result.stderr).strip()}")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -173,6 +209,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    resume_if_needed()
     server = http.server.ThreadingHTTPServer(("0.0.0.0", RELAY_PORT), Handler)
     server.serve_forever()
 

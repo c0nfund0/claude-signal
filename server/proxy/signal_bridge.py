@@ -22,6 +22,12 @@ instance, by design: the ai instance can only ever *ask* for access via
 and forwarded (in its own thread, so a slow reply never blocks the reader
 thread from seeing an incoming yes/no) to the ai instance's claude_wrapper.
 
+A voice-note attachment instead of text is handled the same way, plus STT/TTS
+either side of the relay - see "Voice messages" below and in the README. That
+STT/TTS work happens in voice_pipeline.py, run as a subprocess in its own
+virtualenv (real dependencies: faster-whisper, edge-tts) so this file - and
+every other proxy daemon - stays pure-stdlib.
+
 Also runs a tiny local HTTP server (127.0.0.1:$BRIDGE_PORT) exposing POST
 /send, used by approval_daemon to ask us to message the user, and GET /status
 for idle_monitor.
@@ -32,7 +38,9 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -55,6 +63,16 @@ CS2_SSH_HOSTNAME = os.environ.get("CS2_SSH_HOSTNAME", "")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "7801"))
 LOCAL_ADMIN_PORT = os.environ.get("LOCAL_ADMIN_PORT", "7802")
 SIGNAL_CLI_SOCKET = os.environ.get("SIGNAL_CLI_SOCKET", "/run/claude-signal/signal-cli.sock")
+# Where signal-cli writes downloaded attachments, named by their "id" field -
+# default matches its own default data dir ($HOME/.local/share/signal-cli) for
+# the claude-signal user (home=/opt/claude-signal, see the common role).
+SIGNAL_CLI_ATTACHMENTS_DIR = os.environ.get(
+    "SIGNAL_CLI_ATTACHMENTS_DIR", "/opt/claude-signal/.local/share/signal-cli/attachments",
+)
+VOICE_VENV_PYTHON = os.environ.get("VOICE_VENV_PYTHON", "/opt/claude-signal/voice-venv/bin/python3")
+VOICE_PIPELINE_SCRIPT = os.environ.get("VOICE_PIPELINE_SCRIPT", "/opt/claude-signal/voice_pipeline.py")
+VOICE_STT_MODEL = os.environ.get("VOICE_STT_MODEL", "base")
+VOICE_TIMEOUT_SECONDS = int(os.environ.get("VOICE_TIMEOUT_SECONDS", "120"))
 
 ADMIN_BASE = f"http://127.0.0.1:{LOCAL_ADMIN_PORT}"
 AI_BASE = f"http://{AI_PRIVATE_IP}:{RELAY_PORT}"
@@ -157,23 +175,35 @@ class SignalRpcClient:
 
 def on_envelope(envelope):
     data = envelope.get("dataMessage")
-    if not data or not data.get("message"):
+    if not data:
         return
     sender_uuid = envelope.get("sourceUuid")
     if sender_uuid != ALLOWED_SENDER_UUID:
         print(f"ignoring message from unrecognized sender uuid={sender_uuid}", file=sys.stderr)
         return
     touch()
+    # A voice note has isVoiceNote=true; also accept any plain audio/* file
+    # attachment (e.g. one shared rather than recorded in Signal's own UI).
+    audio = next(
+        (a for a in (data.get("attachments") or [])
+         if a.get("isVoiceNote") or (a.get("contentType") or "").startswith("audio/")),
+        None,
+    )
     # Off the reader thread, always - every built-in command handler ends by
     # calling signal_send(), which does rpc.call("send", ...) and blocks
     # waiting for THIS SAME thread to read the response back over the socket.
-    # Calling handle_message() inline here is a guaranteed self-deadlock: the
-    # reader thread can't loop back to read send's response until
-    # handle_message() returns, and it can't return until that wait
-    # completes. Confirmed live - every reply eats the full 30s timeout
-    # before raising, regardless of the daemon's health. Only the chat
-    # fallback (dispatch_prompt) was ever spared, because it already ran on
-    # its own thread; this makes every command handler behave the same way.
+    # Calling a handler inline here is a guaranteed self-deadlock: the reader
+    # thread can't loop back to read send's response until the handler
+    # returns, and it can't return until that wait completes. Confirmed live
+    # - every reply eats the full 30s timeout before raising, regardless of
+    # the daemon's health. Only the chat fallback (dispatch_prompt) was ever
+    # spared, because it already ran on its own thread; this makes every
+    # handler (text command, chat prompt, voice note) behave the same way.
+    if audio is not None:
+        threading.Thread(target=handle_voice_message, args=(audio,), daemon=True).start()
+        return
+    if not data.get("message"):
+        return
     threading.Thread(target=handle_message, args=(data["message"],), daemon=True).start()
 
 
@@ -239,6 +269,120 @@ def dispatch_prompt(text):
         print(f"failed to send reply: {exc}", file=sys.stderr)
 
 
+# -- voice messages -------------------------------------------------------
+# Ask Claude to close every voice-triggered reply with a plain-language
+# TL;DR line, so we have something short enough to speak back without a
+# second LLM call. This rides along in the per-turn prompt text (not
+# --append-system-prompt) specifically because it must apply even mid-session
+# on a --resume'd conversation - see claude_wrapper.py's note on why a system
+# prompt change only takes effect on a freshly created session.
+VOICE_INSTRUCTION = (
+    "\n\n(This message came in as a Signal voice note - the text above is a "
+    "transcription of it. Answer normally, then add one final line on its own, "
+    "starting with exactly \"TL;DR:\", giving a plain-language 1-2 sentence "
+    "summary of your answer suitable to be read aloud - no markdown, no code, "
+    "no lists.)"
+)
+VOICE_TLDR_RE = re.compile(r"(?im)^\s*TL;DR:\s*(.+?)\s*$")
+
+
+def _fallback_voice_summary(reply):
+    """Best-effort spoken summary for when Claude doesn't emit a TL;DR line
+    (wrong format, refusal, etc.) - crude, but better than staying silent on
+    the voice side while the full text reply still goes out either way."""
+    stripped = re.sub(r"```.*?```", "", reply, flags=re.DOTALL)
+    stripped = " ".join(stripped.split())
+    sentences = re.split(r"(?<=[.!?])\s+", stripped)
+    return " ".join(sentences[:2])[:300]
+
+
+def _run_voice_pipeline(args, timeout):
+    result = subprocess.run(
+        [VOICE_VENV_PYTHON, VOICE_PIPELINE_SCRIPT, *args],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip()[-500:] or f"exit {result.returncode}")
+    return result.stdout
+
+
+def dispatch_voice_prompt(text):
+    """Same relay as dispatch_prompt, plus a short spoken-summary reply sent
+    back as a voice-note attachment. Called from handle_voice_message, which
+    is already off the reader thread (see on_envelope), so no extra thread
+    hop is needed here."""
+    try:
+        req = urllib.request.Request(
+            AI_BASE + "/prompt",
+            data=json.dumps({"text": text + VOICE_INSTRUCTION}).encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            reply = json.loads(resp.read()).get("reply", "[empty reply]")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            reply = "Still working on the previous message - try again in a bit."
+        else:
+            reply = f"[ai instance error {exc.code}] {exc.read().decode(errors='replace')[:300]}"
+    except Exception as exc:  # noqa: BLE001
+        reply = f"[relay error] {exc}"
+    touch()
+    try:
+        signal_send(reply)
+    except Exception as exc:  # noqa: BLE001
+        print(f"failed to send reply: {exc}", file=sys.stderr)
+        return
+
+    if reply.startswith("["):
+        return  # An internal error marker (busy/timeout/relay failure), not worth speaking.
+
+    match = VOICE_TLDR_RE.search(reply)
+    summary = match.group(1) if match else _fallback_voice_summary(reply)
+    if not summary:
+        return
+
+    out_path = None
+    try:
+        fd, out_path = tempfile.mkstemp(suffix=".mp3", dir="/tmp")
+        os.close(fd)
+        _run_voice_pipeline(["synthesize", summary, out_path], VOICE_TIMEOUT_SECONDS)
+        rpc.call("send", {"username": [ALLOWED_SENDER_USERNAME], "attachment": [out_path]})
+    except Exception as exc:  # noqa: BLE001 - a failed spoken reply shouldn't be fatal; the text already sent
+        print(f"failed to send voice reply: {exc}", file=sys.stderr)
+    finally:
+        if out_path:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+
+
+def handle_voice_message(attachment):
+    """Transcribes an incoming voice-note attachment and forwards it through
+    the same Claude relay as a typed message, then speaks back a short
+    summary. Runs on its own thread (see on_envelope) - transcription and TTS
+    both take real wall-clock time and must never block the RPC reader thread."""
+    att_id = os.path.basename(attachment.get("id") or "")
+    path = os.path.join(SIGNAL_CLI_ATTACHMENTS_DIR, att_id) if att_id else None
+    if not att_id or not path or not os.path.isfile(path):
+        signal_send("Couldn't find that voice message's attachment on disk.")
+        return
+    try:
+        stdout = _run_voice_pipeline(["transcribe", path, VOICE_STT_MODEL], VOICE_TIMEOUT_SECONDS)
+        parsed = json.loads(stdout)
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"[voice transcription failed] {exc}")
+        return
+    text = (parsed.get("text") or "").strip()
+    if not text:
+        signal_send("Didn't catch any speech in that voice message.")
+        return
+    touch()
+    signal_send(f'Heard: "{text}"')
+    dispatch_voice_prompt(text)
+
+
 YES_NO_RE = re.compile(r"^(yes|no)\s+(\S+)(?:\s+(permanent|forever|\d+[mhd]))?$", re.IGNORECASE)
 BLOCK_RE = re.compile(r"^block\s+(\S+)$", re.IGNORECASE)
 ALLOW_RE = re.compile(r"^allow\s+(\S+)(?:\s+(permanent|forever|\d+[mhd]))?$", re.IGNORECASE)
@@ -275,7 +419,10 @@ cs2 open [permanent|1h|30m|2d] - grant Claude SSH access to the CS2 server (defa
 cs2 close - revoke Claude's SSH access to the CS2 server (default state)
 help - this message
 
-Anything else is sent to Claude as a chat message."""
+Anything else is sent to Claude as a chat message. Send a voice note instead
+of typing and it's transcribed, answered the same way, and answered back with
+a short spoken summary too (as a voice-note reply), in addition to the full
+text reply."""
 
 
 def handle_help():

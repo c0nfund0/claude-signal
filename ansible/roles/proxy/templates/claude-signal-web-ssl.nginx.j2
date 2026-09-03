@@ -1,0 +1,26 @@
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-web-ssl.nginx.j2.
+# HTTPS counterpart to claude-signal-web.nginx.j2, only templated once a Let's
+# Encrypt certificate actually exists for {{ app_domain }} (see main.yml's certbot
+# task - referencing a missing cert file here would fail nginx -t). Same gated
+# content as port 80, plus the auto-open trigger the web_domain Lambda calls once
+# the instances are up - see approval_daemon.py's WebOpenHandler.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name {{ app_domain }};
+
+    ssl_certificate     /etc/letsencrypt/live/{{ app_domain }}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{ app_domain }}/privkey.pem;
+
+    # Deliberately outside the gated `location /` below - this is what lets the
+    # start link open the gate in the first place. The only thing standing between
+    # the open internet and this is the X-Web-Open-Secret header, checked by
+    # WebOpenHandler itself (127.0.0.1-only, not reachable any other way).
+    location /_claude-signal/open {
+        proxy_pass http://127.0.0.1:{{ web_open_port | default(7803) }}/open;
+    }
+
+    location / {
+        include /etc/claude-signal/web_gate_state.conf;
+    }
+}

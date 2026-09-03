@@ -61,6 +61,14 @@ DEPLOY_RELAY_PORT = os.environ.get("DEPLOY_RELAY_PORT", "8443")
 DEPLOY_BASE_URL = f"http://{DEPLOY_PRIVATE_IP}:{DEPLOY_RELAY_PORT}"
 WEB_GATE_SCRIPT = os.environ.get("WEB_GATE_SCRIPT", "/usr/local/sbin/claude-signal-web-gate")
 
+# Single-link start (see README's "Custom domain" section) - empty WEB_OPEN_SECRET
+# means the feature is off, same convention as DEPLOY_PRIVATE_IP above; the listener
+# still starts (harmless - nginx only forwards to it via the app_domain vhost, which
+# itself doesn't exist without a domain configured) but every request 401s.
+WEB_OPEN_SECRET = os.environ.get("WEB_OPEN_SECRET", "")
+WEB_OPEN_PORT = int(os.environ.get("WEB_OPEN_PORT", "7803"))
+APP_DOMAIN = os.environ.get("APP_DOMAIN", "")
+
 # GitHub token lives here and ONLY here now - confirmed live that giving it to the
 # ai-side MCP tool via `claude mcp add --env` persists it in plaintext in
 # ~/.claude.json inside the sandbox container, readable by the same `coder` user
@@ -492,11 +500,43 @@ class AdminHandler(BaseHandler):
         self._json(404, {"error": "not found"})
 
 
+class WebOpenHandler(BaseHandler):
+    """127.0.0.1 only, same as AdminHandler - but reached from the internet
+    indirectly, via app_domain's nginx vhost proxying POST /_claude-signal/open
+    here (see claude-signal-web-ssl.nginx.j2). That path is deliberately outside
+    the gated `location /` block, so it works even while the gate is closed - the
+    WEB_OPEN_SECRET header is the only thing standing between the open internet
+    and this, which is why it's a dedicated secret rather than RELAY_SECRET
+    (different trust boundary: this is reachable from anyone who finds
+    web_domain, not just the ai/deploy instances)."""
+
+    def do_POST(self):
+        if not WEB_OPEN_SECRET or self.headers.get("X-Web-Open-Secret") != WEB_OPEN_SECRET:
+            self._json(401, {"error": "unauthorized"})
+            return
+        if self.path != "/open":
+            self._json(404, {"error": "not found"})
+            return
+        result = subprocess.run(
+            ["sudo", WEB_GATE_SCRIPT, "open"], capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            self._json(500, {"message": f"Failed to open web gate: {result.stderr.strip()}"})
+            return
+        try:
+            notify_signal(f"\U0001f310 {APP_DOMAIN or 'the site'} was opened via the start link.")
+        except Exception:  # noqa: BLE001 - the gate opened either way; a missed notification isn't fatal
+            pass
+        self._json(200, {"message": "Web is now open."})
+
+
 def main():
     threading.Thread(target=prune_loop, daemon=True).start()
     public = http.server.ThreadingHTTPServer(("0.0.0.0", RELAY_PORT), PublicHandler)
     admin = http.server.ThreadingHTTPServer(("127.0.0.1", LOCAL_ADMIN_PORT), AdminHandler)
+    web_open = http.server.ThreadingHTTPServer(("127.0.0.1", WEB_OPEN_PORT), WebOpenHandler)
     threading.Thread(target=admin.serve_forever, daemon=True).start()
+    threading.Thread(target=web_open.serve_forever, daemon=True).start()
     public.serve_forever()
 
 

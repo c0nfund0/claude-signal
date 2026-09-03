@@ -1,0 +1,17 @@
+[Unit]
+Description=claude-signal: attempt a Let's Encrypt renewal on every boot
+# certbot's own certbot.timer already runs this twice a day, but the proxy spends
+# most of its life stopped (idle_monitor stops it after idle_seconds) - a box that
+# only gets started occasionally could easily skip every scheduled timer window
+# between deploys. Running it once at boot too (a no-op unless within 30 days of
+# expiry) gives every start a chance to catch the renewal, not just whichever ones
+# happen to overlap the timer's schedule.
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"
+
+[Install]
+WantedBy=multi-user.target
