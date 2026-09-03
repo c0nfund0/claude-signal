@@ -58,7 +58,11 @@
         "ec2:ModifyInstanceMetadataOptions",
         "ec2:ModifyVolume",
         "ec2:CreateTags",
-        "ec2:DeleteTags"
+        "ec2:DeleteTags",
+        "ec2:AllocateAddress",
+        "ec2:ReleaseAddress",
+        "ec2:AssociateAddress",
+        "ec2:DisassociateAddress"
       ],
       "Resource": "arn:aws:ec2:eu-north-1:ACCOUNT_ID:*",
       "Condition": {
@@ -66,6 +70,21 @@
           "aws:RequestedRegion": "eu-north-1"
         }
       }
+    },
+    {
+      "Sid": "AcmManageProject",
+      "Effect": "Allow",
+      "Action": [
+        "acm:RequestCertificate",
+        "acm:DeleteCertificate",
+        "acm:DescribeCertificate",
+        "acm:GetCertificate",
+        "acm:AddTagsToCertificate",
+        "acm:RemoveTagsFromCertificate",
+        "acm:ListTagsForCertificate",
+        "acm:RenewCertificate"
+      ],
+      "Resource": "arn:aws:acm:eu-north-1:ACCOUNT_ID:certificate/*"
     },
     {
       "Sid": "LambdaManageProject",
@@ -143,6 +162,17 @@
         "iam:UntagRole"
       ],
       "Resource": "arn:aws:iam::ACCOUNT_ID:role/claude-signal-*"
+    },
+    {
+      "Sid": "ApiGatewayCustomDomainServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/aws-service-role/ops.apigateway.amazonaws.com/*",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": "ops.apigateway.amazonaws.com"
+        }
+      }
     },
     {
       "Sid": "IamPassRoleScoped",
