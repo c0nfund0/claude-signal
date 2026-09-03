@@ -131,3 +131,32 @@ variable "deploy_http_port" {
   type        = number
   default     = 8080
 }
+
+# --- Optional: single-link start (see README's "Custom domain" section) ---
+# Leave both domains "" to skip this whole feature - no EIP, no ACM cert, no custom
+# domain gets created, and behavior is exactly what it was before (a fresh public IP
+# each start, `open`/`close` only via Signal).
+
+variable "web_domain" {
+  description = "Hostname (e.g. web.example.com) that starts the proxy+deploy instances and auto-opens the site when hit - mapped to the Lambda controller via an API Gateway custom domain. You manage DNS yourself (see README) - point this at the CNAME target `terraform output` gives you after the ACM cert is issued."
+  type        = string
+  default     = ""
+}
+
+variable "app_domain" {
+  description = "Hostname (e.g. app.example.com) for the actual deployed site once it's up - served over HTTPS by the proxy's own nginx with a Let's Encrypt cert, at the stable Elastic IP this creates. Point an A record at `terraform output proxy_eip` once applied."
+  type        = string
+  default     = ""
+}
+
+variable "web_open_secret" {
+  description = "Shared secret the Lambda controller sends (as X-Web-Open-Secret) to authorize opening the web gate without going through Signal, when var.web_domain is set - must match the same value in ansible/group_vars/all.yml, exactly like var.stop_secret. Required (32+ chars) only if web_domain is non-empty."
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition     = var.web_open_secret == "" || length(var.web_open_secret) >= 32
+    error_message = "web_open_secret should be a long random string (32+ chars), e.g. `openssl rand -hex 32`."
+  }
+}

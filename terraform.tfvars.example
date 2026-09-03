@@ -20,3 +20,9 @@ stop_secret    = "generate-with-openssl-rand--hex-32" # `openssl rand -hex 32`
 # deploy_root_volume_size = 20
 # deploy_subnet_cidr      = "172.31.131.0/24"
 # deploy_http_port        = 8080
+
+# Optional: single-link start via a custom domain - see README's "Custom domain"
+# section. Leave both domains unset to skip this (no EIP, no ACM cert, no cost).
+# web_domain      = "web.example.com"      # starts instances, auto-opens, redirects
+# app_domain      = "app.example.com"      # the actual site, HTTPS via Let's Encrypt
+# web_open_secret = "generate-with-openssl-rand--hex-32" # required if web_domain is set

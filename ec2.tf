@@ -27,6 +27,31 @@ resource "aws_instance" "proxy" {
   tags = {
     Name = "${var.name}-proxy-instance"
   }
+
+  # data.aws_ami.ubuntu tracks "most_recent" - without this, a newer Ubuntu 22.04
+  # AMI being published upstream would show up as a diff on every future plan/apply
+  # and force a full destroy+recreate of a live, already-registered instance (lost
+  # signal-cli identity, lost everything on the root volume) for no reason anyone
+  # asked for. Rebuilding onto a newer AMI is still possible - just do it
+  # deliberately (taint the resource, or drop this block) rather than by accident.
+  lifecycle {
+    ignore_changes = [ami]
+  }
+}
+
+# An Elastic IP association survives stop/start (unlike the auto-assigned public IP
+# this instance would otherwise get, which is released on every stop) - this is what
+# lets var.app_domain point at a fixed address instead of needing DNS updated on every
+# boot. Only created when a domain is actually configured (see acm.tf); without one,
+# behavior is unchanged from before - a fresh public IP each start, found via /status.
+resource "aws_eip" "proxy" {
+  count    = var.app_domain != "" ? 1 : 0
+  domain   = "vpc"
+  instance = aws_instance.proxy.id
+
+  tags = {
+    Name = "${var.name}-proxy-eip"
+  }
 }
 
 resource "aws_instance" "ai" {
@@ -53,6 +78,11 @@ resource "aws_instance" "ai" {
   tags = {
     Name = "${var.name}-ai-instance"
   }
+
+  # See the matching lifecycle block on aws_instance.proxy above for why.
+  lifecycle {
+    ignore_changes = [ami]
+  }
 }
 
 resource "aws_instance" "deploy" {
@@ -78,6 +108,11 @@ resource "aws_instance" "deploy" {
 
   tags = {
     Name = "${var.name}-deploy-instance"
+  }
+
+  # See the matching lifecycle block on aws_instance.proxy above for why.
+  lifecycle {
+    ignore_changes = [ami]
   }
 }
 

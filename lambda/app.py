@@ -1,5 +1,7 @@
 import json
 import os
+import urllib.error
+import urllib.request
 
 import boto3
 from botocore.exceptions import ClientError
@@ -8,6 +10,13 @@ INSTANCE_ID_AI = os.environ["INSTANCE_ID_AI"]
 INSTANCE_ID_PROXY = os.environ["INSTANCE_ID_PROXY"]
 INSTANCE_ID_DEPLOY = os.environ["INSTANCE_ID_DEPLOY"]
 STOP_SECRET = os.environ["STOP_SECRET"]
+
+# Empty (the default) means the custom-domain feature is off - every request then
+# falls through to the original behavior below, unchanged. See acm.tf / README's
+# "Custom domain" section.
+WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "")
+APP_DOMAIN = os.environ.get("APP_DOMAIN", "")
+WEB_OPEN_SECRET = os.environ.get("WEB_OPEN_SECRET", "")
 
 ec2 = boto3.client("ec2")
 
@@ -72,6 +81,69 @@ HTML_PAGE = """<!doctype html>
 """
 
 
+# Served only on WEB_DOMAIN (see _handle) - starts proxy+deploy like HTML_PAGE, but
+# once both are up it also drives the auto-open call and redirects the browser
+# straight to the live site, instead of just showing status text.
+AUTO_HTML_PAGE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Claude Signal</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; display: flex;
+         align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  .card { text-align: center; }
+  .row { font-size: 1.1rem; font-family: monospace; margin-top: 0.8rem; }
+  .state { color: #9ad; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Claude Signal</h1>
+    <p class="state" id="state">Starting the server...</p>
+    <p class="row" id="proxy"></p>
+    <p class="row" id="deploy"></p>
+  </div>
+  <script>
+    let opening = false;
+    async function tryOpen() {
+      if (opening) return;
+      opening = true;
+      try {
+        const res = await fetch("/open", { method: "POST" });
+        if (res.ok) {
+          document.getElementById("state").textContent = "Redirecting...";
+          window.location.href = "https://APP_DOMAIN/";
+          return;
+        }
+      } catch (e) {
+        // not ready yet - fall through and retry on the next poll tick
+      }
+      opening = false;
+    }
+    async function poll() {
+      try {
+        const res = await fetch("/status");
+        const data = await res.json();
+        document.getElementById("proxy").textContent =
+          "proxy: " + data.proxy.state + (data.proxy.public_ip ? " (" + data.proxy.public_ip + ")" : "");
+        document.getElementById("deploy").textContent = "deploy: " + data.deploy.state;
+        if (data.proxy.state === "running" && data.deploy.state === "running") {
+          document.getElementById("state").textContent = "Opening the site...";
+          tryOpen();
+        }
+      } catch (e) {
+        document.getElementById("state").textContent = "Waiting for the server...";
+      }
+      setTimeout(poll, 3000);
+    }
+    poll();
+  </script>
+</body>
+</html>
+""".replace("APP_DOMAIN", APP_DOMAIN)
+
+
 def _response(status_code, body, content_type="application/json"):
     return {
         "statusCode": status_code,
@@ -114,6 +186,30 @@ def _get_status():
     }
 
 
+def _handle_open():
+    """Called by AUTO_HTML_PAGE's own JS once /status shows both instances up.
+    Confirms that server-side (never trusts the client's poll result alone), then
+    forwards the request to the proxy's real HTTPS hostname - not its IP, so this
+    rides on the same Let's Encrypt cert the browser will land on next, rather than
+    a bare-IP connection with no hostname to verify."""
+    status = _get_status()
+    if status["proxy"]["state"] != "running" or status["deploy"]["state"] != "running":
+        return _response(409, json.dumps({"error": "not running yet"}))
+    req = urllib.request.Request(
+        f"https://{APP_DOMAIN}/_claude-signal/open",
+        method="POST",
+        headers={"X-Web-Open-Secret": WEB_OPEN_SECRET},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except urllib.error.URLError as exc:
+        # Most commonly: nginx/certbot on the proxy isn't fully up yet even though
+        # EC2 reports "running" - the caller's poll loop just retries.
+        return _response(502, json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+    return _response(200, json.dumps({"opened": True}))
+
+
 def handler(event, context):
     try:
         return _handle(event)
@@ -125,6 +221,8 @@ def handler(event, context):
 
 def _handle(event):
     path = event.get("rawPath", "/")
+    domain_name = (event.get("requestContext") or {}).get("domainName", "")
+    is_web_domain = bool(WEB_DOMAIN) and domain_name == WEB_DOMAIN
 
     if path == "/status":
         return _response(200, json.dumps(_get_status()))
@@ -137,6 +235,17 @@ def _handle(event):
             lambda: ec2.stop_instances(InstanceIds=[INSTANCE_ID_PROXY, INSTANCE_ID_AI, INSTANCE_ID_DEPLOY])
         )
         return _response(200, json.dumps({"stopping": True}))
+
+    if path == "/open" and is_web_domain:
+        return _handle_open()
+
+    if is_web_domain:
+        # web_domain's whole purpose is the one-link "view the site" flow: start
+        # proxy + deploy (not ai - same as /web below) and serve the page whose JS
+        # opens the gate and redirects, instead of just showing status text. No
+        # secret required, same posture as /web and the default route always had.
+        _try_transition(lambda: ec2.start_instances(InstanceIds=[INSTANCE_ID_PROXY, INSTANCE_ID_DEPLOY]))
+        return _response(200, AUTO_HTML_PAGE, content_type="text/html")
 
     if path == "/web":
         # Starts the proxy + deploy instances only, not ai - for viewing/managing a

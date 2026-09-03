@@ -76,6 +76,11 @@ resource "aws_lambda_function" "controller" {
       INSTANCE_ID_PROXY  = aws_instance.proxy.id
       INSTANCE_ID_DEPLOY = aws_instance.deploy.id
       STOP_SECRET        = var.stop_secret
+      # Empty when var.web_domain is unset - _handle() treats that as "feature off"
+      # and falls back to its original behavior for every request. See acm.tf.
+      WEB_DOMAIN      = var.web_domain
+      APP_DOMAIN      = var.app_domain
+      WEB_OPEN_SECRET = var.web_open_secret
     }
   }
 

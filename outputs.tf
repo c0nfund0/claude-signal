@@ -3,6 +3,27 @@ output "controller_url" {
   value       = aws_apigatewayv2_stage.default.invoke_url
 }
 
+output "web_domain_validation_records" {
+  description = "DNS record(s) to add at your registrar to validate the web_domain ACM cert (phase 1 of the two-phase apply - see README). Empty unless web_domain is set."
+  value = var.web_domain != "" ? [
+    for o in aws_acm_certificate.web[0].domain_validation_options : {
+      name  = o.resource_record_name
+      type  = o.resource_record_type
+      value = o.resource_record_value
+    }
+  ] : []
+}
+
+output "web_domain_cname_target" {
+  description = "CNAME target for web_domain itself, once the cert is issued (phase 2 - see README). Empty unless web_domain is set."
+  value       = var.web_domain != "" ? aws_apigatewayv2_domain_name.web[0].domain_name_configuration[0].target_domain_name : null
+}
+
+output "proxy_eip" {
+  description = "Stable Elastic IP for the proxy instance - point app_domain's A record here. Empty unless app_domain is set."
+  value       = var.app_domain != "" ? aws_eip.proxy[0].public_ip : null
+}
+
 output "ai_instance_id" {
   description = "EC2 instance ID of the isolated AI (Claude Code) instance"
   value       = aws_instance.ai.id
@@ -14,8 +35,8 @@ output "proxy_instance_id" {
 }
 
 output "proxy_public_ip" {
-  description = "Public IP of the proxy instance as of the last apply/refresh - changes on every stop/start, so prefer the controller URL's /status endpoint for the current value"
-  value       = aws_instance.proxy.public_ip
+  description = "Public IP of the proxy instance as of the last apply/refresh. Stable across stop/start if app_domain is set (see proxy_eip) - otherwise changes on every stop/start, so prefer the controller URL's /status endpoint for the current value"
+  value       = var.app_domain != "" ? aws_eip.proxy[0].public_ip : aws_instance.proxy.public_ip
 }
 
 output "ai_private_ip" {

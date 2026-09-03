@@ -295,3 +295,17 @@ resource "aws_vpc_security_group_ingress_rule" "proxy_http_public" {
   to_port           = 80
   cidr_ipv4         = "0.0.0.0/0"
 }
+
+# Same posture as port 80 above, plus it's what serves the Let's Encrypt cert for
+# var.app_domain (see acm.tf / the proxy role's certbot task) - the gate content
+# behavior is identical, just TLS-terminated. Also carries the /_claude-signal/open
+# path the "start" Lambda calls once instances are up, itself secret-gated - see
+# approval_daemon.py's WebOpenHandler.
+resource "aws_vpc_security_group_ingress_rule" "proxy_https_public" {
+  security_group_id = aws_security_group.proxy.id
+  description       = "Public HTTPS - same gated content as port 80, TLS via Lets Encrypt for var.app_domain"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+}
