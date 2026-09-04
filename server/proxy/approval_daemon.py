@@ -61,6 +61,13 @@ DEPLOY_RELAY_PORT = os.environ.get("DEPLOY_RELAY_PORT", "8443")
 DEPLOY_BASE_URL = f"http://{DEPLOY_PRIVATE_IP}:{DEPLOY_RELAY_PORT}"
 WEB_GATE_SCRIPT = os.environ.get("WEB_GATE_SCRIPT", "/usr/local/sbin/claude-signal-web-gate")
 
+# For AdminHandler's /web/stop-instances (see below) - same secret idle_monitor.py
+# already uses to call the Lambda's /stop. Both live in the same shared env file, so
+# no new secret/plumbing is needed to let signal_bridge trigger this too, just a
+# second reader of an already-present value.
+STOP_SECRET = os.environ.get("STOP_SECRET", "")
+CONTROLLER_URL = os.environ.get("CONTROLLER_URL", "").rstrip("/")
+
 # Single-link start (see README's "Custom domain" section) - empty WEB_OPEN_SECRET
 # means the feature is off, same convention as DEPLOY_PRIVATE_IP above; the listener
 # still starts (harmless - nginx only forwards to it via the app_domain vhost, which
@@ -463,6 +470,27 @@ class AdminHandler(BaseHandler):
                 self._json(500, {"message": f"Failed to set web gate to {state}: {result.stderr.strip()}"})
                 return
             self._json(200, {"message": f"Web is now {state}."})
+            return
+
+        if self.path == "/web/stop-instances":
+            # Mirrors /web/open above but in the other direction, via the Lambda's
+            # /web/stop route (stops proxy+deploy, leaves ai alone) instead of a
+            # local script - stopping an EC2 instance isn't something this host can
+            # do to itself. Same trust model as /web/open: whoever sent this on
+            # Signal is the approver, no separate confirmation needed.
+            if not STOP_SECRET or not CONTROLLER_URL:
+                self._json(500, {"message": "STOP_SECRET/CONTROLLER_URL not configured"})
+                return
+            try:
+                req = urllib.request.Request(
+                    CONTROLLER_URL + "/web/stop", method="GET",
+                    headers={"X-Stop-Secret": STOP_SECRET},
+                )
+                urllib.request.urlopen(req, timeout=15)
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"message": f"Failed to stop: {exc}"})
+                return
+            self._json(200, {"message": "Stopping the proxy and deploy instances."})
             return
 
         self._json(404, {"error": "not found"})

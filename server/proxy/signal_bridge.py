@@ -392,6 +392,7 @@ RESET_RE = re.compile(r"^reset$", re.IGNORECASE)
 URL_RE = re.compile(r"^url$", re.IGNORECASE)
 HELP_RE = re.compile(r"^help$", re.IGNORECASE)
 WEB_RE = re.compile(r"^web$", re.IGNORECASE)
+WEB_STOP_RE = re.compile(r"^web\s+stop$", re.IGNORECASE)
 OPEN_RE = re.compile(r"^open$", re.IGNORECASE)
 CLOSE_RE = re.compile(r"^close$", re.IGNORECASE)
 CS2_RE = re.compile(r"^cs2$", re.IGNORECASE)
@@ -412,6 +413,8 @@ status - what Claude is doing right now (busy/idle + recent activity)
 reset - clear the saved conversation (also needed after a persona/system-prompt change)
 url - the controller URL that starts both instances if they're stopped
 web - start the deploy/web instance, and show what's currently deployed
+web stop - stop the proxy+deploy instances (mirrors web's start, in reverse -
+    also takes this bot itself down, same as an idle auto-stop would)
 open - make the deployed site reachable at http://<proxy public ip>/
 close - stop forwarding public traffic to the deployed site (default state)
 cs2 - show the CS2 server's start URL and whether Claude currently has SSH access to it
@@ -502,6 +505,14 @@ def handle_web():
     except Exception as exc:  # noqa: BLE001
         status_line = f"Couldn't reach the deploy status: {exc}"
     signal_send(f"{status_line}\n\n{_site_url_line()}\n\nStart URL (if the deploy instance is stopped): {start_url}")
+
+
+def handle_web_stop():
+    try:
+        result = admin_call("POST", "/web/stop-instances")
+        signal_send(result.get("message", "done"))
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"Couldn't stop: {exc}")
 
 
 def handle_open():
@@ -635,6 +646,10 @@ def handle_message(text):
 
     if WEB_RE.match(text):
         handle_web()
+        return
+
+    if WEB_STOP_RE.match(text):
+        handle_web_stop()
         return
 
     if OPEN_RE.match(text):
