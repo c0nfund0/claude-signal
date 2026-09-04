@@ -413,8 +413,8 @@ status - what Claude is doing right now (busy/idle + recent activity)
 reset - clear the saved conversation (also needed after a persona/system-prompt change)
 url - the controller URL that starts both instances if they're stopped
 web - start the deploy/web instance, and show what's currently deployed
-web stop - stop the proxy+deploy instances (mirrors web's start, in reverse -
-    also takes this bot itself down, same as an idle auto-stop would)
+web stop - stop just the deploy instance (not the proxy - ai still needs it
+    for internet access via Squid, even with nothing deployed/open right now)
 open - make the deployed site reachable at http://<proxy public ip>/
 close - stop forwarding public traffic to the deployed site (default state)
 cs2 - show the CS2 server's start URL and whether Claude currently has SSH access to it

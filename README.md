@@ -562,7 +562,7 @@ straight, expect to just SSH in and run `sudo certbot renew` by hand afterward.
 | `reset` | Clear the saved conversation. Also needed after changing the persona or any other system-prompt content — see the note below on why. |
 | `url` | The controller URL that starts the proxy+ai instances if they're stopped. |
 | `web` | Start the proxy+deploy instances and show what's currently deployed, plus the site's URL. |
-| `web stop` | Stop the proxy+deploy instances (the reverse of `web`'s start) - also takes this bot itself down with it, same as an idle auto-stop would, since `signal_bridge` runs on the proxy. |
+| `web stop` | Stop just the deploy instance, not the proxy - the proxy also runs Squid, which `ai` depends on for internet access, so it's left alone even if nothing's currently deployed/open. |
 | `open` | Make the currently-deployed site reachable at `http://<proxy public ip>/` (or `https://<app_domain>/` if [configured](#custom-domain-single-link-start)). |
 | `close` | Stop forwarding public traffic to the deployed site (default state). |
 | `cs2` | Show the CS2 server's start URL and whether Claude currently has SSH access to it. Only useful if [CS2 integration](#cs2-game-server-integration-optional) is configured. |

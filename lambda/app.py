@@ -237,14 +237,18 @@ def _handle(event):
         return _response(200, json.dumps({"stopping": True}))
 
     if path == "/web/stop":
-        # Mirrors /web (starts proxy+deploy only, leaves ai alone) but in the other
-        # direction - same secret requirement as /stop, since stopping is the more
-        # disruptive direction (kills the Signal bridge along with it, since that
-        # runs on the proxy too - same as an idle auto-stop already does).
+        # Deploy only, deliberately NOT the proxy - unlike /web's start (which
+        # starts both, since deploy is unreachable without the proxy's reverse
+        # proxy), the proxy also runs Squid, which the ai instance depends on for
+        # all its internet access. Stopping it out from under an active Claude
+        # Code session would silently break that session's outbound traffic even
+        # though ai itself stays "running" - so this only ever touches deploy.
+        # Same secret requirement as /stop, since stopping is the more disruptive
+        # direction.
         headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
         if headers.get("x-stop-secret") != STOP_SECRET:
             return _response(403, json.dumps({"error": "forbidden"}))
-        _try_transition(lambda: ec2.stop_instances(InstanceIds=[INSTANCE_ID_PROXY, INSTANCE_ID_DEPLOY]))
+        _try_transition(lambda: ec2.stop_instances(InstanceIds=[INSTANCE_ID_DEPLOY]))
         return _response(200, json.dumps({"stopping": True}))
 
     if path == "/open" and is_web_domain:

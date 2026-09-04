@@ -473,11 +473,11 @@ class AdminHandler(BaseHandler):
             return
 
         if self.path == "/web/stop-instances":
-            # Mirrors /web/open above but in the other direction, via the Lambda's
-            # /web/stop route (stops proxy+deploy, leaves ai alone) instead of a
-            # local script - stopping an EC2 instance isn't something this host can
-            # do to itself. Same trust model as /web/open: whoever sent this on
-            # Signal is the approver, no separate confirmation needed.
+            # Via the Lambda's /web/stop route (deploy only - see that route's own
+            # comment for why not the proxy too) instead of a local script, since
+            # stopping an EC2 instance isn't something this host can do to itself.
+            # Same trust model as /web/open: whoever sent this on Signal is the
+            # approver, no separate confirmation needed.
             if not STOP_SECRET or not CONTROLLER_URL:
                 self._json(500, {"message": "STOP_SECRET/CONTROLLER_URL not configured"})
                 return
@@ -490,7 +490,7 @@ class AdminHandler(BaseHandler):
             except Exception as exc:  # noqa: BLE001
                 self._json(500, {"message": f"Failed to stop: {exc}"})
                 return
-            self._json(200, {"message": "Stopping the proxy and deploy instances."})
+            self._json(200, {"message": "Stopping the deploy instance."})
             return
 
         self._json(404, {"error": "not found"})
