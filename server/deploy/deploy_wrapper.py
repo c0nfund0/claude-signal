@@ -104,7 +104,14 @@ def do_deploy(repo, branch):
     run = _podman(
         "run", "-d", "--name", CONTAINER_NAME,
         "--cap-drop=all", "--security-opt", "no-new-privileges",
-        "--pids-limit=512", "--memory=512m",
+        # 700m on a 914MB (t3.micro) host: current deploys (chess-coach) sit
+        # around 270MB at rest, but Stockfish spikes got OOM-killed at the
+        # old 500m cap - confirmed via `dmesg -T | grep -i oom`. 700m leaves
+        # roughly 200MB for the host's own overhead (podman, sshd,
+        # unattended-upgrades, this process), which is comfortably more than
+        # it's ever actually used - if a future deploy needs more than this,
+        # move to a bigger instance type rather than raising this further.
+        "--pids-limit=512", "--memory=700m",
         # A *named* volume, so /data outlives the container. An image's own
         # VOLUME directive creates an anonymous one, which the `podman rm -f`
         # above orphans - every deploy then started the app with an empty data
