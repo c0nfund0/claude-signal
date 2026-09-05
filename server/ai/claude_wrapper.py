@@ -14,7 +14,18 @@ POST /prompt {"text": "..."} -> runs `claude -p` (first call) or
 {"reply": "..."}. Blocks the calling HTTP thread for the duration of the run -
 fine, since signal_bridge on the proxy side dispatches each prompt in its own thread.
 
-GET /status -> {"busy": bool, "last_activity": epoch} for idle_monitor.
+If a /prompt arrives while one is already running, it doesn't get rejected: it
+fills a single "pending" slot that overwrites whatever was there before (so
+sending a correction or a new idea before Claude even started on the last one
+just replaces it - the superseded text is never sent to Claude at all, and its
+HTTP caller gets {"superseded": true} instead of a reply, silently, with no
+Signal message). Once the current run finishes, the handler thread that was
+running it picks up whatever is left in the pending slot (if anything) and
+runs that too, on the same thread, before finally clearing "busy" - so at most
+one extra turn is ever queued up behind the one in flight.
+
+GET /status -> {"busy": bool, "last_activity": epoch, "queued": bool} for
+idle_monitor (idle_monitor only reads "busy").
 GET /activity -> same plus {"recent": [...]}, a rolling window of the last few
 tool calls / thinking / text blocks, updated live as claude -p streams - lets
 "status" over Signal show what Claude is doing while it's still working.
@@ -72,7 +83,10 @@ CS2_SSH_HOSTNAME = os.environ.get("CS2_SSH_HOSTNAME", "")
 CS2_CONTROLLER_URL = os.environ.get("CS2_CONTROLLER_URL", "")
 
 state_lock = threading.Lock()
-state = {"busy": False, "last_activity": time.time(), "recent": collections.deque(maxlen=8)}
+# "pending" is either None or a single {"text", "event", "result"} slot - see
+# the module docstring's note on /prompt for how it's used.
+state = {"busy": False, "last_activity": time.time(), "recent": collections.deque(maxlen=8),
+         "pending": None}
 
 
 def load_session_id():
@@ -197,10 +211,54 @@ def _text(value):
     return value.strip().replace("\n", " ") if isinstance(value, str) else ""
 
 
+# One short, plain-language phrase per tool, built from its actual input -
+# "status" over Signal is meant to read like a narration of what's happening,
+# not a dump of tool call JSON. Anything not listed here (the two MCP gate
+# tools included - their input shape isn't worth hardcoding for a status
+# line) falls back to a generic, still-short "Tool: name" below.
+def _describe_bash(i):
+    return f"Running: {i.get('command', '?')[:100]}"
+
+
+def _describe_read(i):
+    return f"Reading {i.get('file_path', '?')}"
+
+
+def _describe_write(i):
+    return f"Writing {i.get('file_path', '?')}"
+
+
+def _describe_edit(i):
+    return f"Editing {i.get('file_path', '?')}"
+
+
+def _describe_grep(i):
+    where = f" in {i['path']}" if i.get("path") else ""
+    return f"Searching for '{i.get('pattern', '?')}'{where}"
+
+
+def _describe_glob(i):
+    return f"Listing files matching '{i.get('pattern', '?')}'"
+
+
+def _describe_webfetch(i):
+    return f"Fetching {i.get('url', '?')}"
+
+
+TOOL_DESCRIBERS = {
+    "Bash": _describe_bash, "Read": _describe_read, "Write": _describe_write,
+    "Edit": _describe_edit, "Grep": _describe_grep, "Glob": _describe_glob,
+    "WebFetch": _describe_webfetch,
+}
+
+
 def summarize_event(obj):
     """Turns one stream-json event into 0+ short human-readable activity lines,
     so a 'status' request over Signal can show what Claude is doing right now -
-    not just busy/idle."""
+    not just busy/idle. Deliberately narrates only what Claude is DOING (its
+    own text/thinking, and each tool call in plain language) and drops raw
+    tool_result payloads entirely - those are the noisiest part of the stream
+    and add little to a quick status glance."""
     msg_type = obj.get("type")
     lines = []
 
@@ -210,23 +268,18 @@ def summarize_event(obj):
             if block_type == "text":
                 text = _text(block.get("text", ""))
                 if text:
-                    lines.append(f"Claude: {text[:160]}")
+                    lines.append(f"Claude: {text[:200]}")
             elif block_type == "thinking":
                 thinking = _text(block.get("thinking", ""))
                 if thinking:
-                    lines.append(f"Thinking: {thinking[:160]}")
+                    lines.append(f"Thinking: {thinking[:200]}")
             elif block_type == "tool_use":
-                tool_input = _text(json.dumps(block.get("input", {})))
-                lines.append(f"Tool call: {block.get('name', '?')}({tool_input[:120]})")
-            elif block_type == "tool_result":
-                content = block.get("content")
-                if isinstance(content, list):
-                    content = " ".join(_text(b.get("text", "")) for b in content if isinstance(b, dict))
-                text = _text(str(content or ""))
-                if text:
-                    lines.append(f"Tool result: {text[:160]}")
+                name = block.get("name", "?")
+                describer = TOOL_DESCRIBERS.get(name)
+                phrase = _text(describer(block.get("input", {}) or {})) if describer else f"Tool: {name}"
+                lines.append(phrase[:160])
     elif msg_type == "result":
-        lines.append(f"Done: {_text(obj.get('result', ''))[:160]}")
+        lines.append(f"Done: {_text(obj.get('result', ''))[:200]}")
 
     return lines
 
@@ -312,13 +365,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
             with state_lock:
-                self._json(200, {"busy": state["busy"], "last_activity": state["last_activity"]})
+                self._json(200, {
+                    "busy": state["busy"],
+                    "last_activity": state["last_activity"],
+                    "queued": state["pending"] is not None,
+                })
             return
         if self.path == "/activity":
             with state_lock:
                 self._json(200, {
                     "busy": state["busy"],
                     "last_activity": state["last_activity"],
+                    "queued": state["pending"] is not None,
                     "recent": list(state["recent"]),
                 })
             return
@@ -349,20 +407,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         with state_lock:
             if state["busy"]:
-                self._json(409, {"error": "busy"})
-                return
-            state["busy"] = True
+                # Something is already running: don't reject this one, just
+                # take the one pending slot. Anything that was already sitting
+                # there (not yet started) is superseded outright - its own
+                # waiting handler thread below wakes up and reports that
+                # instead of a reply, with no Signal message sent for it.
+                superseded = state["pending"]
+                my_slot = {"text": text, "event": threading.Event(), "result": None}
+                state["pending"] = my_slot
+                if superseded is not None:
+                    superseded["result"] = {"superseded": True}
+                    superseded["event"].set()
+            else:
+                state["busy"] = True
+                my_slot = None
 
-        try:
-            reply = run_claude(text)
-        except Exception as exc:  # noqa: BLE001
-            reply = f"[wrapper error] {exc}"
-        finally:
+        if my_slot is not None:
+            my_slot["event"].wait()
+            result = my_slot["result"]
+            if result.get("superseded"):
+                self._json(200, {"superseded": True})
+            else:
+                self._json(200, {"reply": result["reply"]})
+            return
+
+        # This thread now owns "busy" and drives the run - its own text
+        # first, then (in a loop) whatever text is left in the pending slot
+        # when it finishes, since another /prompt may have filled it while
+        # this one was running. Each iteration replies to whichever HTTP
+        # caller is actually waiting on that particular text: its own
+        # connection the first time, otherwise the waiting handler's "result"
+        # + event above.
+        job_text, waiter = text, None
+        while True:
+            try:
+                reply = run_claude(job_text)
+            except Exception as exc:  # noqa: BLE001
+                reply = f"[wrapper error] {exc}"
+
+            if waiter is None:
+                self._json(200, {"reply": reply})
+            else:
+                waiter["result"] = {"reply": reply}
+                waiter["event"].set()
+
             with state_lock:
-                state["busy"] = False
                 state["last_activity"] = time.time()
+                next_job = state["pending"]
+                state["pending"] = None
+                if next_job is None:
+                    state["busy"] = False
+                    break
 
-        self._json(200, {"reply": reply})
+            job_text, waiter = next_job["text"], next_job
 
     def log_message(self, fmt, *args):
         pass

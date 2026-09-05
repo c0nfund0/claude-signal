@@ -242,6 +242,13 @@ def admin_call(method, path, payload=None):
         return json.loads(resp.read())
 
 
+# claude_wrapper now queues a single message behind whatever's already
+# running instead of rejecting it outright (see its /prompt docstring), so a
+# call here can wait out the CURRENT run before its own even starts - up to
+# roughly two runs' worth of time, not one.
+PROMPT_TIMEOUT_SECONDS = 1900
+
+
 def dispatch_prompt(text):
     """Runs off the reader thread (via on_envelope's dispatch, same as every
     other command handler) - a slow/hung claude_wrapper call must never block
@@ -253,13 +260,16 @@ def dispatch_prompt(text):
             method="POST",
             headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=900) as resp:
-            reply = json.loads(resp.read()).get("reply", "[empty reply]")
+        with urllib.request.urlopen(req, timeout=PROMPT_TIMEOUT_SECONDS) as resp:
+            body = json.loads(resp.read())
+        if body.get("superseded"):
+            # Replaced by a later message before Claude ever saw this one -
+            # exactly what was asked for, so stay quiet rather than report it.
+            touch()
+            return
+        reply = body.get("reply", "[empty reply]")
     except urllib.error.HTTPError as exc:
-        if exc.code == 409:
-            reply = "Still working on the previous message - try again in a bit."
-        else:
-            reply = f"[ai instance error {exc.code}] {exc.read().decode(errors='replace')[:300]}"
+        reply = f"[ai instance error {exc.code}] {exc.read().decode(errors='replace')[:300]}"
     except Exception as exc:  # noqa: BLE001 - report any failure back over Signal
         reply = f"[relay error] {exc}"
     touch()
@@ -318,13 +328,16 @@ def dispatch_voice_prompt(text):
             method="POST",
             headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=900) as resp:
-            reply = json.loads(resp.read()).get("reply", "[empty reply]")
+        with urllib.request.urlopen(req, timeout=PROMPT_TIMEOUT_SECONDS) as resp:
+            body = json.loads(resp.read())
+        if body.get("superseded"):
+            # Replaced by a later message before Claude ever saw this one - stay
+            # quiet on both the text and voice reply, same as dispatch_prompt.
+            touch()
+            return
+        reply = body.get("reply", "[empty reply]")
     except urllib.error.HTTPError as exc:
-        if exc.code == 409:
-            reply = "Still working on the previous message - try again in a bit."
-        else:
-            reply = f"[ai instance error {exc.code}] {exc.read().decode(errors='replace')[:300]}"
+        reply = f"[ai instance error {exc.code}] {exc.read().decode(errors='replace')[:300]}"
     except Exception as exc:  # noqa: BLE001
         reply = f"[relay error] {exc}"
     touch()
@@ -442,7 +455,10 @@ def handle_status():
     except Exception as exc:  # noqa: BLE001
         signal_send(f"Couldn't reach the ai instance: {exc}")
         return
-    lines = [f"Claude is {'busy' if data['busy'] else 'idle'}."]
+    line = f"Claude is {'busy' if data['busy'] else 'idle'}."
+    if data.get("queued"):
+        line += " A newer message is queued and will start as soon as this one's done."
+    lines = [line]
     if data.get("recent"):
         lines.append("Recent activity:")
         lines.extend(f"- {line}" for line in data["recent"])
