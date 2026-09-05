@@ -15,6 +15,11 @@ server {
     }
 
     location / {
+        # No IP/User-Agent in the log for anyone browsing the deployed app -
+        # see claude-signal-nolog-format.nginx.j2. Overrides (doesn't stack
+        # with) the default access_log inherited from nginx.conf, so this is
+        # the ONLY record of this traffic - which is the point.
+        access_log /var/log/nginx/claude-signal-web.log claude_signal_no_pii;
         include /etc/claude-signal/web_gate_state.conf;
     }
 }

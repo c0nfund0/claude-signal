@@ -243,6 +243,15 @@
     mode: "0644"
   notify: reload nginx
 
+- name: Template the nginx no-PII log format (http-level, needed by the web-gate site)
+  ansible.builtin.template:
+    src: claude-signal-nolog-format.nginx.j2
+    dest: /etc/nginx/conf.d/claude-signal-nolog-format.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload nginx
+
 - name: Template the nginx web-gate site
   ansible.builtin.template:
     src: claude-signal-web.nginx.j2

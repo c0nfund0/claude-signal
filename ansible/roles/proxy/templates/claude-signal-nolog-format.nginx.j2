@@ -1,0 +1,10 @@
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-nolog-format.nginx.j2.
+# `log_format` is only valid in the http {} context, same reasoning as the
+# websocket upgrade map living here in conf.d rather than in a site file.
+#
+# Deliberately omits $remote_addr/$http_x_forwarded_for/$http_user_agent - used
+# for the deployed-site vhost's own `location /` (see claude-signal-web.nginx.j2
+# and claude-signal-web-ssl.nginx.j2), so visitors browsing the deployed app
+# never have their IP or User-Agent written to disk here. Still keeps enough to
+# debug an outage (time, request line, status, response size) without the PII.
+log_format claude_signal_no_pii '$time_local "$request" $status $body_bytes_sent';
