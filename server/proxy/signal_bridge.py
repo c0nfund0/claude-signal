@@ -249,10 +249,49 @@ def admin_call(method, path, payload=None):
 PROMPT_TIMEOUT_SECONDS = 1900
 
 
+def _ai_busy():
+    """Best-effort, quick check of claude_wrapper's busy state, used only to
+    decide whether to send an immediate "still working" ack before a message
+    goes on to (possibly) sit in its pending slot for a while - see
+    dispatch_prompt/dispatch_voice_prompt. Never raises: a failed check just
+    means no ack, not a broken dispatch."""
+    try:
+        req = urllib.request.Request(
+            AI_BASE + "/status", headers={"Authorization": f"Bearer {RELAY_SECRET}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read()).get("busy", False)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ack_if_busy():
+    """Confirmed production incident: a message sent while Claude was busy got
+    queued (or later silently superseded by a newer one - by design, see
+    claude_wrapper's /prompt docstring) with NO acknowledgment at all, for
+    several minutes, while the actual cause (an unapproved access request
+    stuck at the front of the queue) was invisible - looked exactly like
+    Signal itself had stopped responding. This doesn't change what runs or
+    when - it just makes sure "got it, will get to it" is never mistaken for
+    silence, whether or not this particular message ends up being the one
+    that actually runs."""
+    if _ai_busy():
+        try:
+            signal_send(
+                "(Claude's still working on the previous message - got this one too "
+                "and will get to it right after, no need to resend. If nothing happens "
+                "for a while, send 'list' to check whether it's actually stuck waiting "
+                "on a yes/no approval from you.)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"failed to send busy ack: {exc}", file=sys.stderr)
+
+
 def dispatch_prompt(text):
     """Runs off the reader thread (via on_envelope's dispatch, same as every
     other command handler) - a slow/hung claude_wrapper call must never block
     the RPC reader thread from processing an incoming yes/no reply."""
+    _ack_if_busy()
     try:
         req = urllib.request.Request(
             AI_BASE + "/prompt",
@@ -352,6 +391,7 @@ def dispatch_voice_prompt(text):
     back as a voice-note attachment. Called from handle_voice_message, which
     is already off the reader thread (see on_envelope), so no extra thread
     hop is needed here."""
+    _ack_if_busy()
     try:
         req = urllib.request.Request(
             AI_BASE + "/prompt",
@@ -627,6 +667,21 @@ def handle_cs2_close():
         signal_send(f"Couldn't close CS2 access: {exc}")
 
 
+NEAR_YES_NO_RE = re.compile(r"^(\S+)\s+([0-9a-f]{6})(?:\s+\S+)?$", re.IGNORECASE)
+
+
+def _current_pending_ids():
+    """Best-effort set of request ids currently awaiting yes/no - used only to
+    catch a near-miss typo of the yes/no command below, never to resolve
+    anything itself. A failure here just means the typo-catcher stays quiet,
+    not that anything else breaks."""
+    try:
+        result = admin_call("GET", "/allowlist")
+    except Exception:  # noqa: BLE001
+        return set()
+    return set(re.findall(r"^([0-9a-f]{6}) ->", result.get("message", ""), re.MULTILINE))
+
+
 def handle_message(text):
     text = text.strip()
 
@@ -641,6 +696,22 @@ def handle_message(text):
             signal_send(result.get("message", "done"))
         except Exception as exc:  # noqa: BLE001
             signal_send(f"Couldn't resolve {req_id}: {exc}")
+        return
+
+    # Confirmed production incident: "Yed 287762" (a typo for "Yes 287762")
+    # matched no command at all and got silently sent to Claude as a chat
+    # message instead, leaving the actual request pending indefinitely while
+    # Claude sat there polling for an approval that was never coming - looked
+    # exactly like a hang. Catch a near-miss (right shape, wrong/misspelled
+    # verb) against an id that's ACTUALLY currently pending, rather than
+    # silently forwarding it as chat.
+    m = NEAR_YES_NO_RE.match(text)
+    if m and m.group(1).lower() not in ("yes", "no") and m.group(2) in _current_pending_ids():
+        signal_send(
+            f"'{text}' isn't a command I recognize, and {m.group(2)} is still waiting "
+            f"on you - did you mean 'yes {m.group(2)}' or 'no {m.group(2)}'? "
+            f"(Not sent to Claude as a chat message.)"
+        )
         return
 
     m = BLOCK_RE.match(text)

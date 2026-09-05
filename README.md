@@ -553,6 +553,18 @@ straight, expect to just SSH in and run `sudo certbot renew` by hand afterward.
 
 ### Signal commands
 
+A typo'd `yes`/`no` (e.g. "Yed 287762") doesn't match either command and would
+otherwise be silently sent to Claude as a chat message, leaving the actual
+request pending indefinitely - confirmed as a real incident, see
+`signal_bridge.py`'s `NEAR_YES_NO_RE`. If what you typed has the right shape
+(a word, then a 6-character request id) and that id is genuinely still
+pending, you get a "did you mean yes/no?" reply instead, and it's never
+forwarded to Claude. Separately, any message that arrives while Claude is
+still working on the previous one gets an immediate "still working, got this
+too" acknowledgment - see `_ack_if_busy` - so a message that ends up waiting
+(or later gets silently superseded by a newer one, per the single pending
+slot below) is never mistaken for a stuck bot.
+
 | Command | Does |
 |---|---|
 | `yes <id> [permanent\|1h\|30m\|2d]` | Approve a pending request (default grant: 1h for URL requests; git/deploy/repo-create approvals don't take a duration). |
