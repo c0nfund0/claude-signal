@@ -279,6 +279,37 @@ def dispatch_prompt(text):
         print(f"failed to send reply: {exc}", file=sys.stderr)
 
 
+# /btw never waits behind the main session (see claude_wrapper's /btw
+# docstring), so unlike PROMPT_TIMEOUT_SECONDS this only ever needs to cover
+# one run, not two.
+BTW_TIMEOUT_SECONDS = 950
+
+
+def dispatch_btw(text):
+    """A '/btw <text>' aside: relayed to claude_wrapper's /btw, which runs it
+    as a completely separate, memory-less one-off turn that starts right away
+    even if the main session is busy. Runs off the reader thread, same as
+    dispatch_prompt, for the same reason - never block it on a slow reply."""
+    try:
+        req = urllib.request.Request(
+            AI_BASE + "/btw",
+            data=json.dumps({"text": text}).encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=BTW_TIMEOUT_SECONDS) as resp:
+            reply = json.loads(resp.read()).get("reply", "[empty reply]")
+    except urllib.error.HTTPError as exc:
+        reply = f"[ai instance error {exc.code}] {exc.read().decode(errors='replace')[:300]}"
+    except Exception as exc:  # noqa: BLE001
+        reply = f"[relay error] {exc}"
+    touch()
+    try:
+        signal_send(f"(btw) {reply}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"failed to send reply: {exc}", file=sys.stderr)
+
+
 # -- voice messages -------------------------------------------------------
 # Ask Claude to close every voice-triggered reply with a plain-language
 # TL;DR line, so we have something short enough to speak back without a
@@ -411,6 +442,8 @@ CLOSE_RE = re.compile(r"^close$", re.IGNORECASE)
 CS2_RE = re.compile(r"^cs2$", re.IGNORECASE)
 CS2_OPEN_RE = re.compile(r"^cs2 open(?:\s+(permanent|forever|\d+[mhd]))?$", re.IGNORECASE)
 CS2_CLOSE_RE = re.compile(r"^cs2 close$", re.IGNORECASE)
+BTW_RE = re.compile(r"^/btw\s+(.+)$", re.IGNORECASE | re.DOTALL)
+BTW_EMPTY_RE = re.compile(r"^/btw\s*$", re.IGNORECASE)
 
 # Kept as one source of truth so `help` can't drift from what's actually wired up -
 # update this whenever a command is added or changed, rather than writing a second,
@@ -433,6 +466,9 @@ close - stop forwarding public traffic to the deployed site (default state)
 cs2 - show the CS2 server's start URL and whether Claude currently has SSH access to it
 cs2 open [permanent|1h|30m|2d] - grant Claude SSH access to the CS2 server (default: 1h)
 cs2 close - revoke Claude's SSH access to the CS2 server (default state)
+/btw <message> - a one-off, unrelated aside answered right away even if Claude
+    is busy on the main conversation - no memory of the main conversation or of
+    any earlier /btw, and doesn't show up in "status" or wait behind anything
 help - this message
 
 Anything else is sent to Claude as a chat message. Send a voice note instead
@@ -687,6 +723,15 @@ def handle_message(text):
 
     if CS2_RE.match(text):
         handle_cs2()
+        return
+
+    if BTW_EMPTY_RE.match(text):
+        signal_send("Usage: /btw <message> - say what the aside actually is.")
+        return
+
+    m = BTW_RE.match(text)
+    if m:
+        dispatch_btw(m.group(1))
         return
 
     # handle_message() itself already runs off the reader thread (see

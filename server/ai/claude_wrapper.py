@@ -29,6 +29,13 @@ idle_monitor (idle_monitor only reads "busy").
 GET /activity -> same plus {"recent": [...]}, a rolling window of the last few
 tool calls / thinking / text blocks, updated live as claude -p streams - lets
 "status" over Signal show what Claude is doing while it's still working.
+
+POST /btw {"text": "..."} -> a completely separate, one-off `claude -p` call
+(no --resume, session id discarded rather than saved) for a "by the way, unrelated
+thing" aside - runs immediately even if the main session is busy, rather than
+waiting behind it, and never touches state["busy"]/state["recent"], so it's
+invisible to "status" and the main /prompt queue. See run_claude_scratch's
+docstring for the concurrency tradeoff this implies.
 """
 import collections
 import http.server
@@ -285,6 +292,25 @@ def summarize_event(obj):
 
 
 def run_claude(text):
+    return _invoke_claude(text, session_id=load_session_id(), track_activity=True, save_session=True)
+
+
+def run_claude_scratch(text):
+    """A one-off, throwaway turn for '/btw' - no --resume (so it shares
+    nothing with the main session's history and vice versa), its session id
+    is discarded rather than saved (so a second /btw has no memory of the
+    first either - genuinely temporary each time), and it doesn't touch
+    state["recent"]/state["busy"] at all, so it never shows up in - or is
+    blocked by - the main session's "status". Runs via podman exec into the
+    SAME sandbox container as the main session, on whatever HTTP handler
+    thread called it, so it can run fully concurrently with (or with another)
+    a main-session turn - fine for an unrelated quick question, but it does
+    share that container's filesystem/git working tree, so two runs that
+    happen to edit the same files at the same moment could still collide."""
+    return _invoke_claude(text, session_id=None, track_activity=False, save_session=False)
+
+
+def _invoke_claude(text, session_id, track_activity, save_session):
     # stream-json (not plain json) so recent tool calls / thinking / text land in
     # state["recent"] as they happen, not just after the whole run finishes - that's
     # what makes a "status" query useful while Claude is still working.
@@ -303,7 +329,6 @@ def run_claude(text):
            "--allowedTools", CLAUDE_ALLOWED_TOOLS,
            "--disallowedTools", CLAUDE_DISALLOWED_TOOLS,
            "--append-system-prompt", SYSTEM_PROMPT]
-    session_id = load_session_id()
     if session_id:
         cmd += ["--resume", session_id]
 
@@ -328,10 +353,11 @@ def run_claude(text):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            for summary in summarize_event(obj):
-                with state_lock:
-                    state["recent"].append(summary)
-                    state["last_activity"] = time.time()
+            if track_activity:
+                for summary in summarize_event(obj):
+                    with state_lock:
+                        state["recent"].append(summary)
+                        state["last_activity"] = time.time()
             if obj.get("type") == "result":
                 final_result = obj
         proc.wait()
@@ -344,9 +370,10 @@ def run_claude(text):
             return "[claude timed out]"
         return f"[claude exited {proc.returncode}] {stderr_output.strip()[-800:]}"
 
-    new_sid = final_result.get("session_id")
-    if new_sid:
-        save_session_id(new_sid)
+    if save_session:
+        new_sid = final_result.get("session_id")
+        if new_sid:
+            save_session_id(new_sid)
     return final_result.get("result") or json.dumps(final_result)
 
 
@@ -395,6 +422,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if os.path.exists(SESSION_FILE):
                     os.remove(SESSION_FILE)
             self._json(200, {"reset": True})
+            return
+
+        if self.path == "/btw":
+            # Deliberately outside state_lock/busy entirely - see
+            # run_claude_scratch's docstring for why this is fire-and-forget,
+            # concurrent-safe-enough, and never queued behind the main session.
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            try:
+                reply = run_claude_scratch(body.get("text", ""))
+            except Exception as exc:  # noqa: BLE001
+                reply = f"[wrapper error] {exc}"
+            self._json(200, {"reply": reply})
             return
 
         if self.path != "/prompt":
