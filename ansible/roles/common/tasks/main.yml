@@ -22,3 +22,16 @@
     owner: claude-signal
     group: claude-signal
     mode: "0750"
+
+# Every real path in this system runs on a t3.micro with a single EBS volume -
+# multipathd manages redundant storage paths that don't exist here, and just
+# sits resident (~7MB, confirmed via the dmesg OOM report on the deploy
+# instance). Masked (not just disabled) so a udev block-device event can't
+# reactivate it later.
+- name: Disable and mask multipathd (unused - no multipath storage on any of these instances)
+  ansible.builtin.systemd:
+    name: multipathd
+    enabled: false
+    masked: true
+    state: stopped
+  failed_when: false

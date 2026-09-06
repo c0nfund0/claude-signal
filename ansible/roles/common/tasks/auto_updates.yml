@@ -49,3 +49,40 @@
     enabled: true
     state: started
   when: auto_updates_apt_result is succeeded
+
+# The actual upgrade work (downloading/installing packages) runs under
+# apt-daily-upgrade.service (apt-daily.service just refreshes the package
+# list), not the near-idle unattended-upgrades service above. On a box this
+# memory-constrained, a maintenance task that can simply retry on its next
+# scheduled run is far more expendable than the app/Claude Code/Squid
+# actually serving traffic - so if memory ever gets tight while an upgrade is
+# running, the kernel should sacrifice these processes first. See
+# deploy_wrapper.py's matching --oom-score-adj on the deployed container for
+# the other side of this: making the thing worth protecting less likely to be
+# picked in the first place.
+- name: Ensure systemd drop-in directories exist for the apt-daily units
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - apt-daily.service
+    - apt-daily-upgrade.service
+  when: auto_updates_apt_result is succeeded
+
+- name: Deprioritize the apt-daily units under memory pressure
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item }}.d/99-claude-signal-oom.conf"
+    content: |
+      [Service]
+      OOMScoreAdjust=500
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - apt-daily.service
+    - apt-daily-upgrade.service
+  notify: daemon-reload
+  when: auto_updates_apt_result is succeeded

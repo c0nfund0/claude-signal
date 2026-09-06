@@ -112,6 +112,15 @@ def do_deploy(repo, branch):
         # it's ever actually used - if a future deploy needs more than this,
         # move to a bigger instance type rather than raising this further.
         "--pids-limit=512", "--memory=700m",
+        # Makes the kernel LESS likely to pick this container's processes as
+        # the victim in a host-wide OOM kill (see the swap addition and
+        # apt-daily OOMScoreAdjust in the ansible deploy/common roles for the
+        # other side of this same incident) - a genuinely more important
+        # thing to keep alive than a background maintenance task that can
+        # just retry later. Not the extreme -1000 (never kill this) since a
+        # real runaway leak in the deployed app itself should still be
+        # killable rather than starving everything else on the box instead.
+        "--oom-score-adj=-200",
         # A *named* volume, so /data outlives the container. An image's own
         # VOLUME directive creates an anonymous one, which the `podman rm -f`
         # above orphans - every deploy then started the app with an empty data
