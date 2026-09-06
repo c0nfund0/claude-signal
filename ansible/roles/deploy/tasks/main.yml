@@ -12,6 +12,43 @@
     group: root
     mode: "0644"
 
+# This box is a t3.micro (914MB total RAM) with no swap - confirmed via dmesg
+# that a genuinely host-wide OOM kill (not a container cgroup limit) can
+# happen from a transient spike, e.g. two Stockfish processes briefly
+# overlapping during a chess-coach deploy, even when neither the container
+# nor any single process is anywhere near its own limit. 1G of swap gives the
+# kernel somewhere to spill for a short spike instead of hard-killing a
+# process - it won't help sustained memory pressure (that needs a bigger
+# instance type, not swap), but this looked like exactly the transient kind.
+- name: Check whether a swapfile already exists
+  ansible.builtin.stat:
+    path: /swapfile
+  register: swapfile_stat
+
+- name: Create the swapfile
+  ansible.builtin.command:
+    cmd: fallocate -l 1G /swapfile
+  when: not swapfile_stat.stat.exists
+
+- name: Restrict the swapfile's permissions before formatting it
+  ansible.builtin.file:
+    path: /swapfile
+    mode: "0600"
+  when: not swapfile_stat.stat.exists
+
+- name: Format the swapfile
+  ansible.builtin.command:
+    cmd: mkswap /swapfile
+  when: not swapfile_stat.stat.exists
+
+- name: Enable the swapfile now, and persist it across reboots
+  ansible.builtin.mount:
+    path: none
+    src: /swapfile
+    fstype: swap
+    opts: sw
+    state: mounted
+
 - name: Install Podman and git
   ansible.builtin.apt:
     name:
