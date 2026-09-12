@@ -170,6 +170,58 @@ def trigger_repo_create(req_id, name, description):
     return f"Created private repo: {resp['ssh_url']}"
 
 
+def list_deployed_apps():
+    """Read-only, no approval needed - just reports what's currently deployed
+    (and each container's running state) so Claude can decide whether something
+    needs to be stopped/removed before deploying another app. The deploy
+    instance is a t3.micro; realistically only 1-2 containers fit at once."""
+    try:
+        resp = _call("GET", "/deployments", timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not reach the deploy status: {exc}"
+    return resp.get("message", "(no status)")
+
+
+def trigger_deploy_action(req_id, action, repo):
+    """action is 'stop' or 'remove'. Relays an already-approved container
+    stop/remove through approval_daemon - same one-shot-per-approved-request-id
+    pattern as trigger_deploy."""
+    try:
+        resp = _call("POST", f"/deploy-{action}-trigger", {"id": req_id, "repo": repo}, timeout=40)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        return f"{action.capitalize()} failed: {body[:500]}"
+    except urllib.error.URLError as exc:
+        return f"{action.capitalize()} failed: could not reach the approval service: {exc}"
+    if not resp.get("ok"):
+        return f"{action.capitalize()} failed: {resp.get('error', '?')[:500]}"
+    if action == "stop":
+        return f"Stopped {resp['repo']}."
+    return f"Removed {resp['repo']} (container + image only - its data volume was left intact)."
+
+
+def request_deploy_action(action, repo, summary):
+    kind = f"deploy_{action}"
+    approval_summary = f"{action} deployed app: {repo}\n{summary}"
+    outcome, req_id = request_approval(kind, approval_summary)
+    verb = "stopped" if action == "stop" else "removed"
+    if outcome == "approved":
+        return trigger_deploy_action(req_id, action, repo)
+    if outcome == "denied":
+        return f"Denied by the user. {repo} was not {verb}."
+    if outcome.startswith("error:"):
+        return outcome[len("error:"):]
+    return f"Timed out after {TIMEOUT_SECONDS}s waiting for approval. {repo} was not {verb}."
+
+
+def request_deploy_stop(repo, summary):
+    return request_deploy_action("stop", repo, summary)
+
+
+def request_deploy_remove(repo, summary):
+    return request_deploy_action("remove", repo, summary)
+
+
 def request_repo_create(name, description):
     approval_summary = f"repo name: {name}\ndescription: {description or '(none)'}\nvisibility: private"
     outcome, req_id = request_approval("repo_create", approval_summary)
@@ -212,6 +264,53 @@ TOOLS = [
                 },
             },
             "required": ["repo_path", "branch", "summary"],
+        },
+    },
+    {
+        "name": "list_deployed_apps",
+        "description": (
+            "List what's currently deployed on the deploy/web instance (repo, branch, "
+            "commit, and whether its container is actually running) and each app's public "
+            "URL. Read-only, no approval needed - check this before deploying a new app, "
+            "since the deploy instance is small and realistically only fits 1-2 containers "
+            "at once; stop or remove an existing one first if there isn't room."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "request_deploy_stop",
+        "description": (
+            "Ask the user, over Signal, for permission to stop a deployed app's container "
+            "(without removing it - its image, data volume, and port stay reserved, and "
+            "it comes back on the next deploy or the instance's next boot). Use this to "
+            "free up room on the deploy instance for another app. Blocks until they reply "
+            "yes or no, or times out after 10 minutes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "The deployed repo's short name under c0nfund0, e.g. 'meltline'"},
+                "summary": {"type": "string", "description": "Why this needs to stop, shown to the user"},
+            },
+            "required": ["repo", "summary"],
+        },
+    },
+    {
+        "name": "request_deploy_remove",
+        "description": (
+            "Ask the user, over Signal, for permission to permanently remove a deployed "
+            "app's container and image (freeing its port for a different app). Its named "
+            "data volume is deliberately left alone - this only tears down the running "
+            "app, not its persisted data. Blocks until they reply yes or no, or times out "
+            "after 10 minutes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "The deployed repo's short name under c0nfund0, e.g. 'meltline'"},
+                "summary": {"type": "string", "description": "Why this should be removed, shown to the user"},
+            },
+            "required": ["repo", "summary"],
         },
     },
     {
@@ -258,6 +357,12 @@ def handle(msg):
                     args.get("repo_path", ""), args.get("branch", ""), args.get("summary", ""),
                     args.get("deploy_repo", ""),
                 )
+            elif name == "list_deployed_apps":
+                text = list_deployed_apps()
+            elif name == "request_deploy_stop":
+                text = request_deploy_stop(args.get("repo", ""), args.get("summary", ""))
+            elif name == "request_deploy_remove":
+                text = request_deploy_remove(args.get("repo", ""), args.get("summary", ""))
             elif name == "request_repo_create":
                 text = request_repo_create(args.get("name", ""), args.get("description", ""))
             else:

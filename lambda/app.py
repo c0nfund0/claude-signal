@@ -48,7 +48,7 @@ HTML_PAGE = """<!doctype html>
 </head>
 <body>
   <div class="card">
-    <h1>Claude Signal</h1>
+    <h1>Please wait...</h1>
     <p class="state" id="state">Starting servers...</p>
     <p class="row" id="proxy"></p>
     <p class="row" id="ai"></p>
@@ -99,7 +99,7 @@ AUTO_HTML_PAGE = """<!doctype html>
 </head>
 <body>
   <div class="card">
-    <h1>Claude Signal</h1>
+    <h1>Please wait...</h1>
     <p class="state" id="state">Starting the server...</p>
     <p class="row" id="proxy"></p>
     <p class="row" id="deploy"></p>
@@ -204,8 +204,11 @@ def _handle_open():
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()
     except urllib.error.URLError as exc:
-        # Most commonly: nginx/certbot on the proxy isn't fully up yet even though
-        # EC2 reports "running" - the caller's poll loop just retries.
+        # Most commonly: nginx/certbot on the proxy isn't fully up yet, or it is but
+        # WebOpenHandler's own health probe says the deployed app itself isn't
+        # responding yet (EC2 "running" only means the OS booted, not that whatever's
+        # inside the container has finished starting) - either way the caller's poll
+        # loop just retries.
         return _response(502, json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
     return _response(200, json.dumps({"opened": True}))
 
@@ -249,6 +252,18 @@ def _handle(event):
         if headers.get("x-stop-secret") != STOP_SECRET:
             return _response(403, json.dumps({"error": "forbidden"}))
         _try_transition(lambda: ec2.stop_instances(InstanceIds=[INSTANCE_ID_DEPLOY]))
+        return _response(200, json.dumps({"stopping": True}))
+
+    if path == "/ai/stop":
+        # ai only, deliberately NOT proxy or deploy - the mirror image of /web/stop,
+        # for idle_monitor to use when a mixed session's Signal/Claude Code side has
+        # gone idle but its deployed-app side is still being used: proxy (still
+        # serving the deployed site, still running Squid for when ai comes back) and
+        # deploy both need to keep running. Same secret requirement as /stop.
+        headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+        if headers.get("x-stop-secret") != STOP_SECRET:
+            return _response(403, json.dumps({"error": "forbidden"}))
+        _try_transition(lambda: ec2.stop_instances(InstanceIds=[INSTANCE_ID_AI]))
         return _response(200, json.dumps({"stopping": True}))
 
     if path == "/open" and is_web_domain:

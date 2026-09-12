@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Signal</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    margin: 0;
+  }
+  .card { text-align: center; }
+  .apps {
+    display: flex;
+    gap: 1.5rem;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  a.app {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 9rem;
+    height: 9rem;
+    background: #1b1b1b;
+    border: 1px solid #333;
+    border-radius: 14px;
+    text-decoration: none;
+    transition: background 0.15s, border-color 0.15s, transform 0.15s;
+  }
+  a.app:hover {
+    background: #232323;
+    border-color: #6cf;
+    transform: translateY(-2px);
+  }
+  .icon { font-size: 3.5rem; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="apps">
+      <a class="app" href="/chess"><span class="icon">&#9812;</span></a>
+      <a class="app" href="/meltdown/"><span class="icon">&#10052;&#65039;</span></a>
+    </div>
+  </div>
+</body>
+</html>

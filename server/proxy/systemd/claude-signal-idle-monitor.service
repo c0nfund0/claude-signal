@@ -1,5 +1,5 @@
 [Unit]
-Description=claude-signal: idle monitor (stops both instances when both are idle)
+Description=claude-signal: idle monitor (stops ai/deploy independently once idle, proxy once both are)
 After=network-online.target claude-signal-signal-bridge.service
 Wants=network-online.target
 

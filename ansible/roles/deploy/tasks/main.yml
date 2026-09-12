@@ -41,13 +41,26 @@
     cmd: mkswap /swapfile
   when: not swapfile_stat.stat.exists
 
-- name: Enable the swapfile now, and persist it across reboots
+# state: mounted (rather than just present) misbehaves for swap - it tries to
+# `mount` the entry like a real filesystem instead of `swapon` it, confirmed
+# live: "unknown filesystem type 'swap'". So this only writes the fstab entry;
+# activation is the separate explicit task below.
+- name: Persist the swapfile in fstab
   ansible.builtin.mount:
     path: none
     src: /swapfile
     fstype: swap
     opts: sw
-    state: mounted
+    state: present
+
+- name: Check whether the swapfile is already active
+  ansible.builtin.command: swapon --show=NAME --noheadings
+  register: swapon_show
+  changed_when: false
+
+- name: Activate the swapfile now
+  ansible.builtin.command: swapon /swapfile
+  when: "'/swapfile' not in swapon_show.stdout"
 
 - name: Install Podman and git
   ansible.builtin.apt:

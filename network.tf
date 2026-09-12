@@ -248,10 +248,10 @@ resource "aws_vpc_security_group_ingress_rule" "deploy_relay_from_proxy" {
 
 resource "aws_vpc_security_group_ingress_rule" "deploy_http_from_proxy" {
   security_group_id            = aws_security_group.deploy.id
-  description                  = "HTTP traffic to the currently-deployed container, reverse-proxied from the proxy instance only - the actual internet-facing gate lives on the proxy, approval-controlled"
+  description                  = "HTTP to deploy_wrapper.py dynamic port range, reverse-proxied from the proxy only - opened as a range once so a new deployed app never needs its own terraform apply."
   ip_protocol                  = "tcp"
-  from_port                    = var.deploy_http_port
-  to_port                      = var.deploy_http_port
+  from_port                    = var.deploy_port_range_start
+  to_port                      = var.deploy_port_range_end
   referenced_security_group_id = aws_security_group.proxy.id
 }
 

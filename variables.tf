@@ -127,9 +127,21 @@ variable "deploy_subnet_cidr" {
 }
 
 variable "deploy_http_port" {
-  description = "Port the deploy instance's currently-running deployed container listens on, on the host. The proxy reverse-proxies public port 80 to this port on the deploy instance's private IP, gated by Signal approval - it is never exposed directly."
+  description = "Port the deploy instance's primary deployed container (chess-coach) listens on, on the host. The proxy reverse-proxies public port 80/443 to this port on the deploy instance's private IP, gated by Signal approval - it is never exposed directly."
   type        = number
   default     = 8080
+}
+
+variable "deploy_port_range_start" {
+  description = "Start of the port range deploy_wrapper.py dynamically assigns to whatever it deploys (see server/deploy/deploy_wrapper.py's _allocate_port and deploy_port_range_start/end in ansible/group_vars/all.yml - keep these in sync). Opened once at the security-group level so a new deployed app never needs its own terraform apply; must cover deploy_http_port."
+  type        = number
+  default     = 8080
+}
+
+variable "deploy_port_range_end" {
+  description = "End (inclusive) of the dynamic deploy port range - see deploy_port_range_start."
+  type        = number
+  default     = 8099
 }
 
 # --- Optional: single-link start (see README's "Custom domain" section) ---

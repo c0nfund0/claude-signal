@@ -36,14 +36,30 @@ thing" aside - runs immediately even if the main session is busy, rather than
 waiting behind it, and never touches state["busy"]/state["recent"], so it's
 invisible to "status" and the main /prompt queue. See run_claude_scratch's
 docstring for the concurrency tradeoff this implies.
+
+POST /project {"action": "list"|"new"|"switch"|"back", "name": "..."} -> project
+context switching, so unrelated projects (e.g. two different deployed apps)
+never share a conversation history or a working directory. "new" creates a
+fresh project (empty directory under /home/coder/projects/<name>, no session
+history) and switches to it; "switch" moves to an already-created one; "back"
+swaps to whichever project was active before the last switch (like `cd -`);
+"list" reports the current/previous project and everything that's been
+created. Refused with 409 while a /prompt is in flight - see current_project's
+callers for why. The pre-existing single-session behavior this file always had
+is project "default": unchanged session-id file, and /home/coder itself (not a
+subdirectory) as its working directory, so upgrading to this never disturbed
+whatever was already there.
 """
 import collections
 import http.server
 import json
 import os
+import re
+import signal
 import subprocess
 import threading
 import time
+import uuid
 
 RELAY_PORT = int(os.environ.get("RELAY_PORT", "8443"))
 RELAY_SECRET = os.environ["RELAY_SECRET"]
@@ -89,6 +105,22 @@ CLAUDE_TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "900"))
 CS2_SSH_HOSTNAME = os.environ.get("CS2_SSH_HOSTNAME", "")
 CS2_CONTROLLER_URL = os.environ.get("CS2_CONTROLLER_URL", "")
 
+# Project context switching - lets a Signal user keep separate Claude Code
+# conversations (and separate working directories inside the sandbox) for
+# different projects, so working on one never bleeds into another's context
+# window or git working tree. "default" is the pre-existing single-session
+# behavior this whole file had before project switching existed: its session
+# id is SESSION_FILE (unchanged path, so upgrading doesn't lose the session
+# that was already there) and its workdir is /home/coder itself (not a
+# subdirectory), so whatever's already checked out there keeps working exactly
+# as it did before. Every other project gets its own session-id file under
+# PROJECTS_DIR and its own subdirectory under /home/coder/projects/.
+PROJECTS_DIR = os.environ.get("PROJECTS_DIR", "/opt/claude-signal/projects")
+CURRENT_PROJECT_FILE = os.environ.get("CURRENT_PROJECT_FILE", "/opt/claude-signal/current_project")
+PREVIOUS_PROJECT_FILE = os.environ.get("PREVIOUS_PROJECT_FILE", "/opt/claude-signal/previous_project")
+PROJECT_REGISTRY_FILE = os.path.join(PROJECTS_DIR, "registry.json")
+DEFAULT_PROJECT = "default"
+
 state_lock = threading.Lock()
 # "pending" is either None or a single {"text", "event", "result"} slot - see
 # the module docstring's note on /prompt for how it's used.
@@ -96,15 +128,71 @@ state = {"busy": False, "last_activity": time.time(), "recent": collections.dequ
          "pending": None}
 
 
-def load_session_id():
-    if os.path.exists(SESSION_FILE):
-        content = open(SESSION_FILE).read().strip()
+def _safe_project_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "-", name)
+
+
+def _project_session_file(project: str) -> str:
+    if project == DEFAULT_PROJECT:
+        return SESSION_FILE
+    return os.path.join(PROJECTS_DIR, f"{_safe_project_name(project)}.session_id")
+
+
+def _project_workdir(project: str) -> str:
+    if project == DEFAULT_PROJECT:
+        return "/home/coder"
+    return f"/home/coder/projects/{_safe_project_name(project)}"
+
+
+def _load_registry():
+    if os.path.exists(PROJECT_REGISTRY_FILE):
+        with open(PROJECT_REGISTRY_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def _save_registry(names):
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+    tmp = PROJECT_REGISTRY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(names, f)
+    os.replace(tmp, PROJECT_REGISTRY_FILE)
+
+
+def current_project() -> str:
+    if os.path.exists(CURRENT_PROJECT_FILE):
+        return open(CURRENT_PROJECT_FILE).read().strip() or DEFAULT_PROJECT
+    return DEFAULT_PROJECT
+
+
+def _set_current_project(name):
+    with open(CURRENT_PROJECT_FILE, "w") as f:
+        f.write(name)
+
+
+def _previous_project():
+    if os.path.exists(PREVIOUS_PROJECT_FILE):
+        return open(PREVIOUS_PROJECT_FILE).read().strip() or None
+    return None
+
+
+def _set_previous_project(name):
+    with open(PREVIOUS_PROJECT_FILE, "w") as f:
+        f.write(name)
+
+
+def load_session_id(project):
+    path = _project_session_file(project)
+    if os.path.exists(path):
+        content = open(path).read().strip()
         return content or None
     return None
 
 
-def save_session_id(sid):
-    with open(SESSION_FILE, "w") as f:
+def save_session_id(project, sid):
+    path = _project_session_file(project)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         f.write(sid)
 
 
@@ -139,7 +227,17 @@ GIT_POLICY_PROMPT = (
     "ip>/ once the user runs 'open'), pass deploy_repo (the repo's short name under "
     "c0nfund0) to request_git_push instead of asking for push and deploy "
     "separately - one approval covers both. The repo needs a Containerfile or "
-    "Dockerfile at its root that listens on $PORT."
+    "Dockerfile at its root that listens on $PORT. Deploying assigns that repo its "
+    "own host port and container automatically (nothing to configure) and it becomes "
+    "reachable at http://<proxy public ip>/app/<repo>/ (a button for it also appears "
+    "on the landing page at http://<proxy public ip>/) once the user runs 'open' - "
+    "existing deployments are never affected by deploying a different repo. The deploy "
+    "instance is small and realistically only fits 1-2 containers running at once: "
+    "call the list_deployed_apps MCP tool first to check what's already there, and if "
+    "there's no room, use request_deploy_stop (keeps the container/data, just stops "
+    "it - cheap to bring back) or request_deploy_remove (frees the port entirely, data "
+    "volume left intact) to clear space before deploying something new. Both need the "
+    "user's approval over Signal, same as request_git_push."
 )
 
 # Only appended when CS2_SSH_HOSTNAME is actually configured (see run_claude() below) -
@@ -292,7 +390,10 @@ def summarize_event(obj):
 
 
 def run_claude(text):
-    return _invoke_claude(text, session_id=load_session_id(), track_activity=True, save_session=True)
+    project = current_project()
+    return _invoke_claude(
+        text, session_id=load_session_id(project), track_activity=True, save_session=True, project=project,
+    )
 
 
 def run_claude_scratch(text):
@@ -307,10 +408,46 @@ def run_claude_scratch(text):
     a main-session turn - fine for an unrelated quick question, but it does
     share that container's filesystem/git working tree, so two runs that
     happen to edit the same files at the same moment could still collide."""
-    return _invoke_claude(text, session_id=None, track_activity=False, save_session=False)
+    return _invoke_claude(
+        text, session_id=None, track_activity=False, save_session=False, project=current_project(),
+    )
 
 
-def _invoke_claude(text, session_id, track_activity, save_session):
+def _kill_by_env_marker(marker):
+    """podman exec's client process (what our Popen/proc.kill() below controls) is
+    NOT the parent of the actual `claude` process running inside the container -
+    conmon is, by design, specifically so that a disconnected exec client doesn't
+    take the process down with it. Confirmed live: proc.kill() alone left orphaned
+    `claude -p` processes running indefinitely after every timeout, accumulating
+    over hours until the ai instance's memory and CPU were both exhausted (load
+    average ~19, 9 stuck processes, one from over an hour earlier). Matching on
+    the prompt text isn't reliable enough to find the right one to kill - e.g.
+    "Continue" alone showed up 3 times among the orphans. This instead scans
+    /proc directly for the one process carrying this call's unique marker env var
+    (set via `podman exec -e`, invisible to argv-based matching like `pgrep -f`
+    but readable per-process) - safe to do because this rootless podman setup
+    doesn't isolate PIDs from the host's own namespace, confirmed live (these
+    processes show up in a plain host `ps aux`, no `podman exec ... ps` needed)."""
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return
+    for pid_str in pids:
+        if not pid_str.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid_str}/environ", "rb") as f:
+                environ = f.read()
+        except OSError:
+            continue
+        if marker.encode() in environ:
+            try:
+                os.kill(int(pid_str), signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def _invoke_claude(text, session_id, track_activity, save_session, project):
     # stream-json (not plain json) so recent tool calls / thinking / text land in
     # state["recent"] as they happen, not just after the whole run finishes - that's
     # what makes a "status" query useful while Claude is still working.
@@ -323,7 +460,10 @@ def _invoke_claude(text, session_id, track_activity, save_session):
     # HTTPS_PROXY, CLAUDE_CODE_OAUTH_TOKEN, and the telemetry-disabling vars are NOT
     # set here - they're set once on the container itself (claude-signal-sandbox.service),
     # not per podman-exec call.
-    cmd = [PODMAN_BIN, "exec", "-i", SANDBOX_CONTAINER,
+    # See _kill_by_env_marker for why this exists: it's the only reliable way to
+    # find and actually kill the in-container process if this call times out.
+    run_marker = f"CLAUDE_SIGNAL_RUN_ID={uuid.uuid4().hex}"
+    cmd = [PODMAN_BIN, "exec", "-i", "-w", _project_workdir(project), "-e", run_marker, SANDBOX_CONTAINER,
            "claude", "-p", text, "--output-format", "stream-json", "--verbose",
            "--permission-mode", "acceptEdits",
            "--allowedTools", CLAUDE_ALLOWED_TOOLS,
@@ -341,7 +481,12 @@ def _invoke_claude(text, session_id, track_activity, save_session):
     proc = subprocess.Popen(
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
     )
-    timer = threading.Timer(CLAUDE_TIMEOUT_SECONDS, proc.kill)
+
+    def _on_timeout():
+        proc.kill()  # stops the local exec client from waiting on us further
+        _kill_by_env_marker(run_marker)  # actually stops the process it started
+
+    timer = threading.Timer(CLAUDE_TIMEOUT_SECONDS, _on_timeout)
     timer.start()
     final_result = None
     try:
@@ -373,7 +518,7 @@ def _invoke_claude(text, session_id, track_activity, save_session):
     if save_session:
         new_sid = final_result.get("session_id")
         if new_sid:
-            save_session_id(new_sid)
+            save_session_id(project, new_sid)
     return final_result.get("result") or json.dumps(final_result)
 
 
@@ -396,6 +541,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "busy": state["busy"],
                     "last_activity": state["last_activity"],
                     "queued": state["pending"] is not None,
+                    "project": current_project(),
                 })
             return
         if self.path == "/activity":
@@ -405,6 +551,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "last_activity": state["last_activity"],
                     "queued": state["pending"] is not None,
                     "recent": list(state["recent"]),
+                    "project": current_project(),
                 })
             return
         self._json(404, {"error": "not found"})
@@ -419,9 +566,73 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if state["busy"]:
                     self._json(409, {"error": "busy"})
                     return
-                if os.path.exists(SESSION_FILE):
-                    os.remove(SESSION_FILE)
+                path = _project_session_file(current_project())
+                if os.path.exists(path):
+                    os.remove(path)
             self._json(200, {"reset": True})
+            return
+
+        if self.path == "/project":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            action = body.get("action", "")
+            name = _safe_project_name(body.get("name", "").strip())
+            with state_lock:
+                busy = state["busy"]
+            if busy and action != "list":
+                self._json(409, {"error": "busy - switching context mid-run would be ambiguous about which project the in-flight message belongs to"})
+                return
+
+            if action == "list":
+                self._json(200, {
+                    "current": current_project(), "previous": _previous_project(),
+                    "projects": [DEFAULT_PROJECT] + _load_registry(),
+                })
+                return
+
+            if action == "new":
+                if not name or name == DEFAULT_PROJECT:
+                    self._json(400, {"error": "invalid project name"})
+                    return
+                registry = _load_registry()
+                if name in registry:
+                    self._json(409, {"error": f"project '{name}' already exists - use 'switch' instead"})
+                    return
+                mk = subprocess.run(
+                    [PODMAN_BIN, "exec", SANDBOX_CONTAINER, "mkdir", "-p", _project_workdir(name)],
+                    env=dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}"),
+                    capture_output=True, text=True, timeout=15,
+                )
+                if mk.returncode != 0:
+                    self._json(500, {"error": f"couldn't create project directory: {mk.stderr.strip()}"})
+                    return
+                registry.append(name)
+                _save_registry(registry)
+                _set_previous_project(current_project())
+                _set_current_project(name)
+                self._json(200, {"project": name, "created": True})
+                return
+
+            if action == "switch":
+                if name != DEFAULT_PROJECT and name not in _load_registry():
+                    self._json(404, {"error": f"no such project: '{name}' - use action 'new' to create it first"})
+                    return
+                _set_previous_project(current_project())
+                _set_current_project(name)
+                self._json(200, {"project": name, "switched": True})
+                return
+
+            if action == "back":
+                prev = _previous_project()
+                if not prev:
+                    self._json(404, {"error": "no previous project to switch back to"})
+                    return
+                _set_previous_project(current_project())
+                _set_current_project(prev)
+                self._json(200, {"project": prev, "switched": True})
+                return
+
+            self._json(400, {"error": "action must be one of: list, new, switch, back"})
             return
 
         if self.path == "/btw":

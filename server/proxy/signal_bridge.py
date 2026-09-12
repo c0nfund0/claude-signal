@@ -477,6 +477,7 @@ URL_RE = re.compile(r"^url$", re.IGNORECASE)
 HELP_RE = re.compile(r"^help$", re.IGNORECASE)
 WEB_RE = re.compile(r"^web$", re.IGNORECASE)
 WEB_STOP_RE = re.compile(r"^web\s+stop$", re.IGNORECASE)
+AI_STOP_RE = re.compile(r"^ai\s+stop$", re.IGNORECASE)
 OPEN_RE = re.compile(r"^open$", re.IGNORECASE)
 CLOSE_RE = re.compile(r"^close$", re.IGNORECASE)
 CS2_RE = re.compile(r"^cs2$", re.IGNORECASE)
@@ -484,6 +485,10 @@ CS2_OPEN_RE = re.compile(r"^cs2 open(?:\s+(permanent|forever|\d+[mhd]))?$", re.I
 CS2_CLOSE_RE = re.compile(r"^cs2 close$", re.IGNORECASE)
 BTW_RE = re.compile(r"^/btw\s+(.+)$", re.IGNORECASE | re.DOTALL)
 BTW_EMPTY_RE = re.compile(r"^/btw\s*$", re.IGNORECASE)
+PROJECT_LIST_RE = re.compile(r"^project$", re.IGNORECASE)
+PROJECT_NEW_RE = re.compile(r"^project\s+new\s+(\S+)$", re.IGNORECASE)
+PROJECT_BACK_RE = re.compile(r"^project\s+back$", re.IGNORECASE)
+PROJECT_SWITCH_RE = re.compile(r"^project\s+(\S+)$", re.IGNORECASE)
 
 # Kept as one source of truth so `help` can't drift from what's actually wired up -
 # update this whenever a command is added or changed, rather than writing a second,
@@ -497,10 +502,18 @@ block <domain> - revoke a domain's access immediately, however it was granted
 list - show the current allowlist and any pending requests
 status - what Claude is doing right now (busy/idle + recent activity)
 reset - clear the saved conversation (also needed after a persona/system-prompt change)
+project - list the current/previous project and every project that's been created
+project new <name> - create a fresh project (empty working directory, no
+    conversation history) and switch to it - use this so a different project's
+    context never bleeds into another's
+project <name> - switch to an already-created project
+project back - switch back to whichever project was active before the last switch
 url - the controller URL that starts both instances if they're stopped
 web - start the deploy/web instance, and show what's currently deployed
 web stop - stop just the deploy instance (not the proxy - ai still needs it
     for internet access via Squid, even with nothing deployed/open right now)
+ai stop - stop just the ai instance (not the proxy or deploy - useful to cut
+    a session short without disturbing a deployed/open site)
 open - make the deployed site reachable at http://<proxy public ip>/
 close - stop forwarding public traffic to the deployed site (default state)
 cs2 - show the CS2 server's start URL and whether Claude currently has SSH access to it
@@ -531,7 +544,7 @@ def handle_status():
     except Exception as exc:  # noqa: BLE001
         signal_send(f"Couldn't reach the ai instance: {exc}")
         return
-    line = f"Claude is {'busy' if data['busy'] else 'idle'}."
+    line = f"Claude is {'busy' if data['busy'] else 'idle'} (project: {data.get('project', 'default')})."
     if data.get("queued"):
         line += " A newer message is queued and will start as soon as this one's done."
     lines = [line]
@@ -589,6 +602,59 @@ def _site_url_line():
     return f"Site URL (while open): http://{public_ip}/" if public_ip else "Site URL: couldn't determine this instance's public IP"
 
 
+def _project_call(action, name=None):
+    payload = {"action": action}
+    if name:
+        payload["name"] = name
+    req = urllib.request.Request(
+        AI_BASE + "/project", data=json.dumps(payload).encode(), method="POST",
+        headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def handle_project_list():
+    try:
+        data = _project_call("list")
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"Couldn't reach the ai instance: {exc}")
+        return
+    lines = [f"Current project: {data['current']}"]
+    if data.get("previous"):
+        lines.append(f"Previous: {data['previous']} (switch back with 'project back')")
+    lines.append("All projects: " + ", ".join(data.get("projects", [])))
+    signal_send("\n".join(lines))
+
+
+def _handle_project_switch(action, name=None):
+    try:
+        data = _project_call(action, name)
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read() or b"{}")
+        signal_send(f"Couldn't switch project: {body.get('error', f'HTTP {exc.code}')}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"Couldn't reach the ai instance: {exc}")
+        return
+    if data.get("created"):
+        signal_send(f"Created and switched to project '{data['project']}' - fresh context, empty working directory.")
+    else:
+        signal_send(f"Switched to project '{data['project']}'.")
+
+
+def handle_project_new(name):
+    _handle_project_switch("new", name)
+
+
+def handle_project_switch(name):
+    _handle_project_switch("switch", name)
+
+
+def handle_project_back():
+    _handle_project_switch("back")
+
+
 def handle_web():
     start_url = CONTROLLER_URL.rstrip("/") + "/web"
     try:
@@ -602,6 +668,14 @@ def handle_web():
 def handle_web_stop():
     try:
         result = admin_call("POST", "/web/stop-instances")
+        signal_send(result.get("message", "done"))
+    except Exception as exc:  # noqa: BLE001
+        signal_send(f"Couldn't stop: {exc}")
+
+
+def handle_ai_stop():
+    try:
+        result = admin_call("POST", "/ai/stop-instances")
         signal_send(result.get("message", "done"))
     except Exception as exc:  # noqa: BLE001
         signal_send(f"Couldn't stop: {exc}")
@@ -753,6 +827,24 @@ def handle_message(text):
         handle_reset()
         return
 
+    if PROJECT_LIST_RE.match(text):
+        handle_project_list()
+        return
+
+    m = PROJECT_NEW_RE.match(text)
+    if m:
+        handle_project_new(m.group(1))
+        return
+
+    if PROJECT_BACK_RE.match(text):
+        handle_project_back()
+        return
+
+    m = PROJECT_SWITCH_RE.match(text)
+    if m:
+        handle_project_switch(m.group(1))
+        return
+
     if URL_RE.match(text):
         # Only useful while this bot is actually running, obviously - if both
         # instances are stopped, nothing here can answer at all. This is just a
@@ -773,6 +865,10 @@ def handle_message(text):
 
     if WEB_STOP_RE.match(text):
         handle_web_stop()
+        return
+
+    if AI_STOP_RE.match(text):
+        handle_ai_stop()
         return
 
     if OPEN_RE.match(text):

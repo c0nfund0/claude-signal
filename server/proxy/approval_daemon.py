@@ -59,7 +59,77 @@ PERMANENT_SEED_DOMAINS = [
 DEPLOY_PRIVATE_IP = os.environ.get("DEPLOY_PRIVATE_IP", "")
 DEPLOY_RELAY_PORT = os.environ.get("DEPLOY_RELAY_PORT", "8443")
 DEPLOY_BASE_URL = f"http://{DEPLOY_PRIVATE_IP}:{DEPLOY_RELAY_PORT}"
+# The deployed app's own port (what the web gate proxies public traffic to), not
+# DEPLOY_RELAY_PORT above (deploy_wrapper.py's separate management API) - used by
+# WebOpenHandler to check whether the app itself is actually responding yet.
+DEPLOY_HTTP_PORT = os.environ.get("DEPLOY_HTTP_PORT", "8080")
 WEB_GATE_SCRIPT = os.environ.get("WEB_GATE_SCRIPT", "/usr/local/sbin/claude-signal-web-gate")
+WEB_GATE_STATE_PATH = "/etc/claude-signal/web_gate_state.conf"
+# The one hand-integrated app (owns `/` and its own internal /chess route,
+# unlike a generic deploy which gets /app/<repo>/) - see _sync_apps below.
+PRIMARY_REPO = os.environ.get("DEPLOY_PRIMARY_REPO", "chess-coach")
+APPS_CONF_PATH = "/etc/claude-signal/apps.conf"
+LANDING_PAGE_PATH = "/var/www/claude-signal-landing/index.html"
+# Repos this build happens to know a nicer icon for - anything else auto-deployed
+# still gets a real button, just with a generic glyph instead of a bespoke one.
+APP_ICONS = {"meltline": "&#10052;&#65039;"}
+DEFAULT_APP_ICON = "&#128230;"
+# {{BUTTONS}} is replaced by _render_landing_page - kept in sync with
+# claude-signal-landing.html.j2's styling (which only ever seeds the initial
+# file; this is what actually renders it from then on).
+LANDING_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Signal</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    margin: 0;
+  }
+  .card { text-align: center; }
+  .apps {
+    display: flex;
+    gap: 1.5rem;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  a.app {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 9rem;
+    height: 9rem;
+    background: #1b1b1b;
+    border: 1px solid #333;
+    border-radius: 14px;
+    text-decoration: none;
+    transition: background 0.15s, border-color 0.15s, transform 0.15s;
+  }
+  a.app:hover {
+    background: #232323;
+    border-color: #6cf;
+    transform: translateY(-2px);
+  }
+  .icon { font-size: 3.5rem; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="apps">
+{{BUTTONS}}
+    </div>
+  </div>
+</body>
+</html>
+"""
 
 # For AdminHandler's /web/stop-instances (see below) - same secret idle_monitor.py
 # already uses to call the Lambda's /stop. Both live in the same shared env file, so
@@ -284,13 +354,16 @@ class PublicHandler(BaseHandler):
             body = self._read_json()
             kind = body.get("kind")
             summary = body.get("summary", "")
-            if kind not in ("git_push", "repo_create", "deploy"):
+            if kind not in ("git_push", "repo_create", "deploy", "deploy_stop", "deploy_remove"):
                 self._json(400, {"error": "invalid kind"})
                 return
             req_id = secrets.token_hex(3)
             with state_lock:
                 pending[req_id] = {"kind": kind, "summary": summary, "status": "pending", "created": time.time()}
-            verb = {"git_push": "push", "repo_create": "create a new private repo", "deploy": "push and deploy"}[kind]
+            verb = {
+                "git_push": "push", "repo_create": "create a new private repo", "deploy": "push and deploy",
+                "deploy_stop": "stop a deployed app", "deploy_remove": "remove a deployed app",
+            }[kind]
             try:
                 notify_signal(
                     f"Claude wants to {verb}:\n{summary}\n\n"
@@ -332,13 +405,55 @@ class PublicHandler(BaseHandler):
             )
             try:
                 with urllib.request.urlopen(req, timeout=600) as resp:
-                    self._json(200, json.loads(resp.read()))
+                    result = json.loads(resp.read())
+                if result.get("ok"):
+                    _sync_apps()
+                self._json(200, result)
             except urllib.error.HTTPError as exc:
                 # Forward the deploy instance's own error detail (e.g. which stage
                 # of clone/build/run failed) rather than swallowing it.
                 self._json(exc.code, json.loads(exc.read() or b"{}"))
             except Exception as exc:  # noqa: BLE001
                 self._json(502, {"error": f"deploy relay failed: {exc}"})
+            return
+
+        if self.path in ("/deploy-stop-trigger", "/deploy-remove-trigger"):
+            # Mirrors /deploy-trigger's one-shot-per-approved-request-id pattern -
+            # see its comment above for why this has to be a relay through the
+            # proxy at all (the ai instance has no network path to deploy).
+            action = "stop" if self.path == "/deploy-stop-trigger" else "remove"
+            kind = f"deploy_{action}"
+            body = self._read_json()
+            req_id = body.get("id", "")
+            repo = body.get("repo", "")
+            with state_lock:
+                entry = pending.get(req_id)
+                if not entry or entry.get("kind") != kind or entry.get("status") != "approved":
+                    self._json(403, {"error": f"no matching approved {kind} request"})
+                    return
+                if entry.get("executed"):
+                    self._json(409, {"error": "already executed"})
+                    return
+                entry["executed"] = True
+            if not DEPLOY_PRIVATE_IP:
+                self._json(503, {"error": "deploy instance not configured"})
+                return
+            req = urllib.request.Request(
+                f"{DEPLOY_BASE_URL}/{action}",
+                data=json.dumps({"repo": repo}).encode(),
+                method="POST",
+                headers={"Authorization": f"Bearer {RELAY_SECRET}", "Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    result = json.loads(resp.read())
+                if result.get("ok"):
+                    _sync_apps()
+                self._json(200, result)
+            except urllib.error.HTTPError as exc:
+                self._json(exc.code, json.loads(exc.read() or b"{}"))
+            except Exception as exc:  # noqa: BLE001
+                self._json(502, {"error": f"{action} relay failed: {exc}"})
             return
 
         if self.path == "/repo-create-trigger":
@@ -398,6 +513,12 @@ class PublicHandler(BaseHandler):
                 self._json(404, {"error": "unknown request id"})
                 return
             self._json(200, {"status": entry["status"]})
+            return
+        if self.path == "/deployments":
+            # Read-only - for mcp_git_gate.py's list_deployed_apps tool, so Claude
+            # can check what's already running (and how much room is left on the
+            # small deploy instance) before asking to deploy something new.
+            self._json(200, {"message": _describe_deployments()})
             return
         self._json(404, {"error": "not found"})
 
@@ -490,7 +611,32 @@ class AdminHandler(BaseHandler):
             except Exception as exc:  # noqa: BLE001
                 self._json(500, {"message": f"Failed to stop: {exc}"})
                 return
+            # Otherwise web_gate_state.conf keeps saying "open" from this session even
+            # once deploy is gone - nginx would just 502/hang on it instead of a clean
+            # "closed" 503, and the next real re-open would wrongly look like "already
+            # open" to _gate_already_open() and skip its Signal notification.
+            subprocess.run(["sudo", WEB_GATE_SCRIPT, "closed"], capture_output=True, text=True, check=False)
             self._json(200, {"message": "Stopping the deploy instance."})
+            return
+
+        if self.path == "/ai/stop-instances":
+            # Via the Lambda's /ai/stop route (ai only, leaves proxy/deploy running -
+            # see that route's own comment) - same trust model as /web/stop-instances
+            # above: whoever sent this on Signal is the approver, no separate
+            # confirmation needed.
+            if not STOP_SECRET or not CONTROLLER_URL:
+                self._json(500, {"message": "STOP_SECRET/CONTROLLER_URL not configured"})
+                return
+            try:
+                req = urllib.request.Request(
+                    CONTROLLER_URL + "/ai/stop", method="GET",
+                    headers={"X-Stop-Secret": STOP_SECRET},
+                )
+                urllib.request.urlopen(req, timeout=15)
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"message": f"Failed to stop: {exc}"})
+                return
+            self._json(200, {"message": "Stopping the ai instance."})
             return
 
         self._json(404, {"error": "not found"})
@@ -506,26 +652,151 @@ class AdminHandler(BaseHandler):
             if not DEPLOY_PRIVATE_IP:
                 self._json(200, {"message": "Deploy instance not configured yet."})
                 return
-            try:
-                req = urllib.request.Request(
-                    DEPLOY_BASE_URL + "/status",
-                    headers={"Authorization": f"Bearer {RELAY_SECRET}"},
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    deployed = json.loads(resp.read())
-            except Exception as exc:  # noqa: BLE001
-                self._json(200, {"message": f"Couldn't reach the deploy instance (is it running? try the /web start URL): {exc}"})
-                return
-            if deployed.get("repo"):
-                body_msg = (
-                    f"Deployed: {deployed['repo']}@{deployed['branch']} ({deployed['commit']})\n"
-                    f"Container running: {deployed['container_running']}"
-                )
-            else:
-                body_msg = "Nothing deployed yet."
-            self._json(200, {"message": body_msg})
+            self._json(200, {"message": _describe_deployments()})
             return
         self._json(404, {"error": "not found"})
+
+
+def _get_deployments():
+    """Raises on failure - callers that can tell the user "couldn't reach it"
+    want that; _sync_apps below just wants to know to leave things as they are."""
+    req = urllib.request.Request(
+        DEPLOY_BASE_URL + "/status", headers={"Authorization": f"Bearer {RELAY_SECRET}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read()).get("deployments", {})
+
+
+def _describe_deployments():
+    """Shared by AdminHandler's /web/status (signal_bridge, via the admin-only
+    listener) and PublicHandler's /deployments (mcp_git_gate.py's
+    list_deployed_apps tool, via the ai-reachable listener) - same read-only
+    information, reached from two different trust boundaries."""
+    try:
+        deployments = _get_deployments()
+    except Exception as exc:  # noqa: BLE001
+        return f"Couldn't reach the deploy instance (is it running? try the /web start URL): {exc}"
+    if not deployments:
+        return "Nothing deployed yet."
+    return "\n".join(
+        f"{d['repo']}@{d['branch']} ({d['commit']}) - container running: {d['container_running']}"
+        for d in deployments.values()
+    )
+
+
+def _write_file(path, content):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def _render_apps_conf(deployments):
+    """One location block pair per non-primary deployed repo, proxying
+    /app/<repo>/ to that repo's currently-assigned port with the prefix
+    stripped (the trailing slash on proxy_pass does that) - see
+    deploy_wrapper.py's dynamic port allocation. Shares the same gate-state
+    toggle as `/` (chess-coach) and logs to the same no-PII access log, so
+    idle_monitor.py's "is anyone using the deployed app(s)" check already
+    covers these without any changes there."""
+    lines = ["# Managed by approval_daemon.py's _sync_apps - regenerated after every",
+             "# deploy/stop/remove. Do not edit by hand; it will be overwritten.", ""]
+    for repo, info in sorted(deployments.items()):
+        if repo == PRIMARY_REPO:
+            continue
+        port = info.get("http_port")
+        if not port:
+            continue
+        path = f"/app/{repo}"
+        lines.append(f"location = {path} {{ return 301 {path}/; }}")
+        lines.append(f"location {path}/ {{")
+        lines.append("    include /etc/claude-signal/web_gate_state.conf;")
+        lines.append('    if ($gate_closed) { return 503 "closed\\n"; }')
+        lines.append("    access_log /var/log/nginx/claude-signal-web.log claude_signal_no_pii;")
+        lines.append(f"    proxy_pass http://{DEPLOY_PRIVATE_IP}:{port}/;")
+        lines.append("    proxy_set_header Host $host;")
+        lines.append("    proxy_set_header X-Real-IP $remote_addr;")
+        lines.append("    proxy_connect_timeout 5s;")
+        lines.append("    proxy_http_version 1.1;")
+        lines.append("}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+LANDING_PAGE_BUTTON = '      <a class="app" href="{href}"><span class="icon">{icon}</span></a>'
+
+
+def _render_landing_page(deployments):
+    """chess-coach's button is fixed (it's the one hand-integrated app, always
+    at /chess); one more button per other currently-deployed repo, generated
+    from whatever deploy_wrapper.py reports - so a newly deployed app appears
+    here automatically, with no template/ansible change needed."""
+    buttons = [LANDING_PAGE_BUTTON.format(href="/chess", icon="&#9812;")]
+    for repo in sorted(deployments):
+        if repo == PRIMARY_REPO:
+            continue
+        icon = APP_ICONS.get(repo, DEFAULT_APP_ICON)
+        buttons.append(LANDING_PAGE_BUTTON.format(href=f"/app/{repo}/", icon=icon))
+    return LANDING_PAGE_TEMPLATE.replace("{{BUTTONS}}", "\n".join(buttons))
+
+
+def _sync_apps():
+    """Regenerates apps.conf and the landing page from whatever's currently
+    deployed, then reloads nginx - called on startup (in case deploy state
+    changed while this process was down) and after every successful deploy/
+    stop/remove. Best-effort: a sync failure here shouldn't fail the deploy/
+    stop/remove itself, which already succeeded on the deploy instance by the
+    time this runs - it just means the proxy's routing/landing page lag behind
+    until the next successful sync."""
+    try:
+        deployments = _get_deployments()
+    except Exception as exc:  # noqa: BLE001
+        print(f"apps sync: couldn't reach deploy instance: {exc}")
+        return
+    try:
+        _write_file(APPS_CONF_PATH, _render_apps_conf(deployments))
+        _write_file(LANDING_PAGE_PATH, _render_landing_page(deployments))
+        result = subprocess.run(
+            ["sudo", WEB_GATE_SCRIPT, "reload"], capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            print(f"apps sync: nginx reload failed: {result.stderr.strip()}")
+    except OSError as exc:
+        print(f"apps sync: failed to write config: {exc}")
+
+
+def _deploy_app_responds(timeout=3):
+    """EC2 reporting the deploy instance as "running" only means the OS booted -
+    the container inside can still be starting up (image pull, app init, slow
+    imports) for a while after that. This is the actual "is anyone home" check:
+    any HTTP response at all (even an error status) from the deployed app's own
+    port means something is listening and speaking HTTP - that's all this can
+    assume generically, since whatever's currently deployed isn't guaranteed to
+    expose a dedicated /healthz route of its own."""
+    if not DEPLOY_PRIVATE_IP:
+        return False
+    try:
+        with urllib.request.urlopen(f"http://{DEPLOY_PRIVATE_IP}:{DEPLOY_HTTP_PORT}/", timeout=timeout) as resp:
+            resp.read(1)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def _gate_already_open():
+    """Whether web_gate_state.conf currently holds the "open" (proxy_pass) block
+    rather than the "closed" (503) one - see claude-signal-web-gate.sh.j2. Used to
+    only notify_signal on an actual closed->open transition, not on every /open
+    call while a session is already up (every page load of app_domain re-triggers
+    AUTO_HTML_PAGE's poll -> /open flow, which would otherwise re-notify on every
+    single visit for as long as deploy stays running)."""
+    try:
+        with open(WEB_GATE_STATE_PATH) as f:
+            return f.read().lstrip().startswith("proxy_pass")
+    except OSError:
+        return False
 
 
 class WebOpenHandler(BaseHandler):
@@ -545,20 +816,30 @@ class WebOpenHandler(BaseHandler):
         if self.path != "/open":
             self._json(404, {"error": "not found"})
             return
+        if not _deploy_app_responds():
+            # Not ready yet - the caller (Lambda's _handle_open, in turn AUTO_HTML_PAGE's
+            # client-side poll loop) treats any non-2xx here as "retry shortly", so it's
+            # safe to say so rather than opening the gate onto a backend that would just
+            # 502/hang. Deliberately not opened or notified in this case.
+            self._json(503, {"error": "deploy app not responding yet"})
+            return
+        already_open = _gate_already_open()
         result = subprocess.run(
             ["sudo", WEB_GATE_SCRIPT, "open"], capture_output=True, text=True, check=False,
         )
         if result.returncode != 0:
             self._json(500, {"message": f"Failed to open web gate: {result.stderr.strip()}"})
             return
-        try:
-            notify_signal(f"\U0001f310 {APP_DOMAIN or 'the site'} was opened via the start link.")
-        except Exception:  # noqa: BLE001 - the gate opened either way; a missed notification isn't fatal
-            pass
+        if not already_open:
+            try:
+                notify_signal(f"\U0001f310 {APP_DOMAIN or 'the site'} was opened via the start link.")
+            except Exception:  # noqa: BLE001 - the gate opened either way; a missed notification isn't fatal
+                pass
         self._json(200, {"message": "Web is now open."})
 
 
 def main():
+    _sync_apps()
     threading.Thread(target=prune_loop, daemon=True).start()
     public = http.server.ThreadingHTTPServer(("0.0.0.0", RELAY_PORT), PublicHandler)
     admin = http.server.ThreadingHTTPServer(("127.0.0.1", LOCAL_ADMIN_PORT), AdminHandler)

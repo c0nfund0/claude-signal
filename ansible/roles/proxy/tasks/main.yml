@@ -135,6 +135,16 @@
     mode: "0750"
   notify: restart idle-monitor
 
+# nginx's access logs are www-data:adm 0640 (Ubuntu's default logrotate config
+# for /var/log/nginx/*.log - confirmed live), so idle_monitor needs adm-group
+# membership to read claude-signal-web.log for its web-session idle check.
+- name: Add claude-signal to the adm group (read access to nginx logs for idle_monitor)
+  ansible.builtin.user:
+    name: claude-signal
+    groups: adm
+    append: true
+  notify: restart idle-monitor
+
 # GITHUB_TOKEN is deliberately NOT kept in group_vars/all.yml - the user sets it by
 # SSHing into the box directly (never pasted into chat/session, same rule as every
 # other credential here). If group_vars doesn't define github_token, preserve
@@ -227,10 +237,19 @@
 - name: Seed the web gate state as closed (only if missing - live runtime state, never overwritten)
   ansible.builtin.copy:
     content: |
-      return 503 "closed\n";
+      set $gate_closed 1;
     dest: /etc/claude-signal/web_gate_state.conf
     owner: root
     group: root
+    mode: "0644"
+    force: false
+
+- name: Seed an empty apps.conf (only if missing - approval_daemon.py owns regenerating this from here on)
+  ansible.builtin.copy:
+    content: "# Managed by approval_daemon.py - see its _sync_apps. Empty until the first deploy.\n"
+    dest: /etc/claude-signal/apps.conf
+    owner: claude-signal
+    group: claude-signal
     mode: "0644"
     force: false
 
@@ -251,6 +270,23 @@
     group: root
     mode: "0644"
   notify: reload nginx
+
+- name: Create the landing page directory (claude-signal-owned - approval_daemon.py rewrites the file directly, no sudo needed)
+  ansible.builtin.file:
+    path: /var/www/claude-signal-landing
+    state: directory
+    owner: claude-signal
+    group: claude-signal
+    mode: "0755"
+
+- name: Seed the landing page (only if missing - approval_daemon.py owns regenerating this from here on)
+  ansible.builtin.template:
+    src: claude-signal-landing.html.j2
+    dest: /var/www/claude-signal-landing/index.html
+    owner: claude-signal
+    group: claude-signal
+    mode: "0644"
+    force: false
 
 - name: Template the nginx web-gate site
   ansible.builtin.template:
