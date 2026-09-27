@@ -72,7 +72,12 @@ APPS_CONF_PATH = "/etc/claude-signal/apps.conf"
 LANDING_PAGE_PATH = "/var/www/claude-signal-landing/index.html"
 # Repos this build happens to know a nicer icon for - anything else auto-deployed
 # still gets a real button, just with a generic glyph instead of a bespoke one.
-APP_ICONS = {"meltline": "&#10052;&#65039;"}
+APP_ICONS = {
+    "meltline": "&#10052;&#65039;",
+    "fantasyhockey": "&#127954;",  # ice hockey stick and puck
+    "claude-api": "&#129302;",  # robot face
+    "deadwall": "&#129503;",  # zombie - it's a zombie tower-defense game
+}
 DEFAULT_APP_ICON = "&#128230;"
 # {{BUTTONS}} is replaced by _render_landing_page - kept in sync with
 # claude-signal-landing.html.j2's styling (which only ever seeds the initial
