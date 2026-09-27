@@ -1,0 +1,93 @@
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-llm-edge.nginx.j2.
+# Public edge for the home LLM box (github.com/c0nfund0/LocalModel) - only
+# templated once a Let's Encrypt cert for {{ llm_edge_domain }} actually exists
+# (see main.yml's certbot task). The HTTP-01 challenge itself is served by the
+# catch-all port-80 vhost in claude-signal-web.nginx.j2, which already handles
+# any hostname.
+#
+# This replaces what the LocalModel repo's edge/bootstrap.sh would normally use
+# Caddy for (TLS + an API-key gate + reverse proxy to the WireGuard peer) -
+# Caddy isn't used here since nginx already owns ports 80/443 on this host for
+# the rest of claude-signal. WireGuard itself is unaffected: it terminates
+# directly on this host, independent of nginx/Caddy either way.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name {{ llm_edge_domain }};
+
+    ssl_certificate     /etc/letsencrypt/live/{{ llm_edge_domain }}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{ llm_edge_domain }}/privkey.pem;
+
+    # No IP/User-Agent in the log for anyone hitting the LLM edge - same posture
+    # as the deployed-app traffic elsewhere on this proxy.
+    access_log /var/log/nginx/claude-signal-llm-edge.log claude_signal_no_pii;
+
+    # Unauthenticated health probe for uptime checks - matches bootstrap.sh's
+    # Caddyfile, which also exempts /health from the API-key gate below.
+    location = /health {
+        proxy_pass http://{{ llm_edge_home_wg_ip }}:{{ llm_edge_upstream_port }};
+        proxy_http_version 1.1;
+        proxy_connect_timeout 5s;
+    }
+
+    # Deliberately unauthenticated: a WireGuard PUBLIC key is not sensitive
+    # (this is exactly what you'd otherwise paste into the peer's config by
+    # hand) - publishing it lets home/setup.sh fetch it with a plain `curl`
+    # instead of it needing to be copied in manually. Serving the raw key
+    # file directly, not proxied - this is the edge's own key, not the home
+    # box's, so no tunnel/upstream is involved at all.
+    location = /edge-pubkey {
+        alias /var/www/llm-edge-public/edge-pubkey;
+        default_type text/plain;
+    }
+
+    location / {
+        # default_type has to sit outside the `if` below - nginx only allows a
+        # small directive set (return/rewrite/set/...) inside `if {}`, and
+        # default_type isn't one of them. Harmless for the proxied path below:
+        # proxy_pass responses always carry their own real Content-Type, so
+        # this default is only ever actually used by the 401 `return`.
+        default_type application/json;
+        set $llm_edge_authed 0;
+        if ($http_x_api_key = "{{ llm_edge_api_key }}") {
+            set $llm_edge_authed 1;
+        }
+        if ($http_authorization = "Bearer {{ llm_edge_api_key }}") {
+            set $llm_edge_authed 1;
+        }
+        if ($llm_edge_authed = 0) {
+            return 401 '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}';
+        }
+
+        proxy_pass http://{{ llm_edge_home_wg_ip }}:{{ llm_edge_upstream_port }};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_connect_timeout 5s;
+        # Streaming (SSE) responses must flush immediately, not buffer until the
+        # upstream closes - matches Caddyfile's `flush_interval -1`.
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+
+# Serves the API key in plain text, but ONLY reachable over the WireGuard
+# tunnel itself (bound to the tunnel's own address, not 0.0.0.0) - the public
+# internet has no route to 10.8.0.1 at all, so this needs no auth of its own;
+# only an already-registered peer (i.e. the home box, once claude-signal-llm-
+# edge-add-peer has run) can ever reach it. This is what actually eliminates
+# the API key from ever needing to be typed or pasted anywhere by hand - the
+# home box fetches it itself once its tunnel comes up.
+server {
+    listen {{ llm_edge_wg_address.split('/')[0] }}:{{ llm_edge_internal_port }};
+    server_name _;
+
+    location = /api-key {
+        default_type text/plain;
+        return 200 "{{ llm_edge_api_key }}";
+    }
+
+    location / {
+        return 404;
+    }
+}

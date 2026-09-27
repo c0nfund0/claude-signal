@@ -16,6 +16,14 @@ deployed something and the user is now also browsing it) wind down each side
 on its own schedule instead of an active deploy session being killed by ai's
 inactivity or vice versa.
 
+Proxy auto-stop was removed for a while (2026-09) once it started also
+hosting the LLM edge for the home GPU box (see group_vars/all.yml's llm_edge_*
+vars) - llm.luodot.com and the WireGuard tunnel go dark whenever proxy is
+stopped, which this brings back deliberately anyway, per an explicit choice to
+prioritize idle cost savings over the edge's always-on reachability. If that
+tradeoff ever flips back, remove the stop_everything branch below again
+rather than re-deriving it from scratch.
+
 Must run on the proxy - it's the only instance with a route to the internet,
 and therefore to the Lambda controller's URL.
 """
@@ -169,10 +177,11 @@ def main():
 
         # Both sides done (or never running to begin with, on whichever side just
         # crossed its own threshold) - nothing is left for proxy to serve, so take
-        # it down too. Deliberately keyed off the *_stop_due flags rather than just
-        # "not running", so a brief window where one side hasn't finished booting
-        # yet (EC2 "pending", not yet "running") never looks like "idle" and
-        # triggers a stop moments after the user just asked for a start.
+        # it down too (see the module docstring for why this is back). Deliberately
+        # keyed off the *_stop_due flags rather than just "not running", so a brief
+        # window where one side hasn't finished booting yet (EC2 "pending", not yet
+        # "running") never looks like "idle" and triggers a stop moments after the
+        # user just asked for a start.
         stop_everything = (ai_running and ai_stop_due and (not deploy_running or deploy_stop_due)) or (
             deploy_running and deploy_stop_due and (not ai_running or ai_stop_due)
         )

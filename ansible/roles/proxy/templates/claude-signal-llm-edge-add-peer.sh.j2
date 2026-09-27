@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-llm-edge-add-peer.sh.j2.
+# Mirrors edge-add-peer from the LocalModel repo's edge/bootstrap.sh: registers
+# (or replaces) the home GPU box as the single WireGuard peer, idempotently -
+# safe to re-run any time the home box's key changes.
+set -euo pipefail
+PUB="${1:?usage: claude-signal-llm-edge-add-peer <home-wireguard-public-key>}"
+
+sed -i '/^\[Peer\]/,$d' /etc/wireguard/wg0.conf
+cat >> /etc/wireguard/wg0.conf <<CFG
+
+[Peer]
+# home GPU box
+PublicKey = ${PUB}
+AllowedIPs = {{ llm_edge_home_wg_ip }}/32
+CFG
+systemctl restart wg-quick@wg0
+echo "peer registered; waiting for handshake (needs the GPU box tunnel to be up)"
+for i in $(seq 1 12); do
+  if wg show wg0 latest-handshakes | awk '{exit !($2>0)}'; then
+    echo "handshake OK"
+    wg show
+    exit 0
+  fi
+  sleep 5
+done
+echo "no handshake yet. Check: GPU box wg0 up, Endpoint = {{ proxy_public_ip }}:{{ llm_edge_wg_port }}, UDP {{ llm_edge_wg_port }} open (already is, at the security-group level)."
+wg show

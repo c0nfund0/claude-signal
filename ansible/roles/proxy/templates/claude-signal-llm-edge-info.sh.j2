@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Managed by Ansible - see ansible/roles/proxy/templates/claude-signal-llm-edge-info.sh.j2.
+# Mirrors edge-info from the LocalModel repo's edge/bootstrap.sh, adapted for
+# nginx instead of Caddy (the API key lives in the nginx vhost, not a Caddy
+# env file - there's nothing else to read it from here).
+set -euo pipefail
+echo "EDGE_DOMAIN={{ llm_edge_domain }}"
+echo "EDGE_PUBLIC_IP={{ proxy_public_ip }}"
+echo "EDGE_WG_PUBLIC_KEY=$(cat /etc/claude-signal/llm-edge-wg.pub)"
+echo "API_KEY={{ llm_edge_api_key }}"
+echo -n "PEER_STATUS: "
+wg show wg0 latest-handshakes 2>/dev/null | awk '{ if ($2>0) print "handshake " systime()-$2 "s ago"; else print "no handshake yet" }' | head -1 || echo "wg0 not up"

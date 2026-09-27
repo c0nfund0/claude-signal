@@ -1,0 +1,10 @@
+# Managed by Ansible ONLY for the [Interface] block, and only seeded once (see
+# the "Seed the WireGuard interface config" task - force: false) - this file
+# gains a [Peer] block at runtime via `edge-add-peer`, which ansible must never
+# overwrite. PrivateKey is generated once on the host itself (see the "Generate
+# the edge WireGuard keypair" task) and read back in here, never stored in this
+# repo.
+[Interface]
+Address = {{ llm_edge_wg_address }}
+ListenPort = {{ llm_edge_wg_port }}
+PrivateKey = {{ llm_edge_wg_private_key }}

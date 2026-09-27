@@ -309,3 +309,19 @@ resource "aws_vpc_security_group_ingress_rule" "proxy_https_public" {
   to_port           = 443
   cidr_ipv4         = "0.0.0.0/0"
 }
+
+# WireGuard tunnel for the home LLM edge (llm.luodot.com, see the LocalModel repo's
+# docs/AWS-HANDOFF.md) - the proxy plays the "edge" role from that doc instead of a
+# separate dedicated instance, reusing its existing Elastic IP. Scoped to admin_cidr
+# rather than 0.0.0.0/0: the home box's ISP IP is the only peer that should ever
+# reach this, and it's the same IP admin_cidr already tracks. Note this makes the
+# tunnel fragile to that IP changing (silently stops matching, no error) - widen
+# this if the home connection moves to a different/dynamic IP.
+resource "aws_vpc_security_group_ingress_rule" "proxy_wireguard_public" {
+  security_group_id = aws_security_group.proxy.id
+  description       = "WireGuard tunnel from the home LLM box (llm.luodot.com edge)"
+  ip_protocol       = "udp"
+  from_port         = 51820
+  to_port           = 51820
+  cidr_ipv4         = var.admin_cidr
+}
